@@ -1,0 +1,8 @@
+The classic puzzle: clear the field without setting off a mine.
+
+Numbers tell how many of the eight cells around them hide mines; flag the ones you find, reveal
+the rest. Beginner, Intermediate and Expert fields, or one of your own size, with the best time
+of each kept. Plays with the mouse or the keyboard.
+
+Also the example of how to build, sign and publish a BMDS package:
+https://github.com/jthwho/bmds-apps

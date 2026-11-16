@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+# @file      release
+# @copyright Jason Howard. All rights reserved.
+#
+# SPDX-License-Identifier: MIT
+# See LICENSE file in the project root folder for license information.
+#
+# Makes a release of bmds-apps: every package, the index naming them and key.pub, built in
+# build-release/ and signed with KEY, into release/TAG/; with --publish, a GitHub release of those
+# files. The release workflow (.github/workflows/release.yml) runs this; so can you, with the key
+# on your own machine instead of in GitHub (README.md, "Releasing").
+#
+#   tools/release --key KEY [--sdk-dir DIR] [--dev] [--publish [--prerelease]] [--repo OWNER/NAME] TAG
+#
+# TAG is the release's git tag (v1, v2...): HEAD must be it, and the tree clean, unless --dev
+# (to try a release from any tree; never published). The files are named relatively in the
+# index, so a release's download folder is a repository by itself, and the newest release's is
+# the one users add: pkg source add https://github.com/OWNER/NAME/releases/latest/download
+# (a pre-release is never "latest": publish one with --prerelease to try it by its own URL).
+#
+# Python's standard library, cmake, the SDK's toolchain, and gh to publish.
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+BUILD = os.path.join(ROOT, "build-release")
+DEFAULT_REPO = "jthwho/bmds-apps"
+
+
+def fail(message):
+    sys.exit("release: " + message)
+
+
+def run(command, cwd=None, capture=False):
+    print("+ " + " ".join(command), flush=True)
+    r = subprocess.run(command, cwd=cwd, text=True, capture_output=capture)
+    if r.returncode != 0:
+        fail("%s failed%s" % (command[0], (":\n" + r.stdout + r.stderr) if capture else ""))
+    return r.stdout if capture else ""
+
+
+def git(*args):
+    return subprocess.run(["git"] + list(args), cwd=ROOT, capture_output=True, text=True).stdout.strip()
+
+
+def main():
+    p = argparse.ArgumentParser(description="Make (and publish) a release of bmds-apps.")
+    p.add_argument("tag", help="the release's tag (v1, v2...)")
+    p.add_argument("--key", required=True, help="the private signing key (never in the repository)")
+    p.add_argument("--sdk-dir", help="build against this SDK (<bmds>/sdk) instead of the pinned release's")
+    p.add_argument("--dev", action="store_true", help="from any tree, to try it (never published)")
+    p.add_argument("--publish", action="store_true", help="make the GitHub release (gh)")
+    p.add_argument("--prerelease", action="store_true", help="publish as a pre-release (never 'latest')")
+    p.add_argument("--repo", default=DEFAULT_REPO, help="the GitHub repository (default %s)" % DEFAULT_REPO)
+    o = p.parse_args()
+
+    if o.publish and o.dev:
+        fail("--dev releases aren't published")
+    if not os.path.isfile(o.key):
+        fail("%s: no key there (mkpkg keygen makes one; README.md)" % o.key)
+    if not o.dev:
+        if git("status", "--porcelain"):
+            fail("the tree has changes: commit them, or try with --dev")
+        if git("rev-parse", "HEAD") != git("rev-parse", "%s^{commit}" % o.tag):
+            fail("HEAD isn't %s: tag it first (git tag %s)" % (o.tag, o.tag))
+    if o.publish and not shutil.which("gh"):
+        fail("gh isn't installed (https://cli.github.com)")
+
+    # A build of its own, from scratch: nothing from a developer's build gets in.
+    shutil.rmtree(BUILD, ignore_errors=True)
+    configure = ["cmake", "-S", ROOT, "-B", BUILD, "-G", "Ninja", "-DBMDS_KEY=" + os.path.abspath(o.key)]
+    if o.sdk_dir:
+        configure.append("-DBMDS_SDK_DIR=" + os.path.abspath(o.sdk_dir))
+    run(configure)
+    # The project's `build` wrapper where there is one (it paces the jobs to the machine).
+    run(["build"] if shutil.which("build") else ["cmake", "--build", "."], cwd=BUILD)
+
+    repository = os.path.join(BUILD, "repository")
+    out = os.path.join(ROOT, "release", o.tag)
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    files = sorted(os.listdir(repository))
+    for name in files:
+        shutil.copy(os.path.join(repository, name), out)
+    print("release %s in %s:" % (o.tag, out))
+    for name in files:
+        print("  %-40s %9d bytes" % (name, os.path.getsize(os.path.join(out, name))))
+
+    if o.publish:
+        notes = "bmds-apps %s: %s.\n\nAdd this repository to BMDS once:\n\n" \
+                "    pkg source add https://github.com/%s/releases/latest/download\n" % (
+                    o.tag, ", ".join(n[:-5] for n in files if n.endswith(".bmpk")), o.repo)
+        command = ["gh", "release", "create", o.tag, "--repo", o.repo, "--verify-tag", "--title",
+                   "bmds-apps " + o.tag, "--notes", notes]
+        if o.prerelease:
+            command.append("--prerelease")
+        run(command + [os.path.join(out, n) for n in files])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

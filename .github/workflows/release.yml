@@ -1,0 +1,57 @@
+# A release for every tag v*: the apps built with the pinned BMDS SDK, signed with the bmds-apps
+# key (the repository secret BMDS_APPS_KEY), and published as a GitHub release by tools/release.
+# A tag with a '-' in it (v2-rc1) makes a pre-release, which users' "latest" never points at.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # the release
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # No SDK pinned yet (CMakeLists.txt's BMDS_SDK_VERSION): such a release is made by hand with
+      # tools/release --sdk-dir, and this does nothing (README.md, "Releasing").
+      - name: The pinned SDK
+        id: pin
+        run: |
+          if grep -Eq 'set\(BMDS_SDK_VERSION "[^"]+"' CMakeLists.txt; then
+            echo "pinned=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No BMDS SDK pinned in CMakeLists.txt: release $GITHUB_REF_NAME by hand (tools/release --sdk-dir)."
+          fi
+
+      # The compiler the SDK names (its sdk/TOOLCHAIN): keep these in step when the SDK moves.
+      - name: Espressif's GCC
+        if: steps.pin.outputs.pinned == 'yes'
+        run: |
+          url=https://github.com/espressif/crosstool-NG/releases/download/esp-15.2.0_20250929/riscv32-esp-elf-15.2.0_20250929-x86_64-linux-gnu.tar.xz
+          curl -fsSL -o "$RUNNER_TEMP/gcc.tar.xz" "$url"
+          echo "516abd1c8e9646d8b846f180d7c06d95494822df93aa967e097c6591f6e4d4d6  $RUNNER_TEMP/gcc.tar.xz" | sha256sum -c
+          tar xJf "$RUNNER_TEMP/gcc.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/riscv32-esp-elf/bin" >> "$GITHUB_PATH"
+
+      - name: Ninja, and Python's cryptography (mkpkg signs with it)
+        if: steps.pin.outputs.pinned == 'yes'
+        run: sudo apt-get install -y ninja-build python3-cryptography
+
+      # The key exists only for this step, in a file only this user can read.
+      - name: Build, sign and publish
+        if: steps.pin.outputs.pinned == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BMDS_APPS_KEY: ${{ secrets.BMDS_APPS_KEY }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          key="$RUNNER_TEMP/bmds-apps.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$BMDS_APPS_KEY" > "$key")
+          pre=""
+          case "$TAG" in *-*) pre=--prerelease ;; esac
+          python3 tools/release --key "$key" --publish $pre --repo "$GITHUB_REPOSITORY" "$TAG"

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Minesweeper
+Comment=Clear the field without setting off a mine
+Exec=minesweeper
+Categories=Game;LogicGame;
+X-BMDS-Id=minesweeper
