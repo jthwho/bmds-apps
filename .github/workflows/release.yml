@@ -50,8 +50,10 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           key="$RUNNER_TEMP/bmds-apps.key"
-          trap 'rm -f "$key"' EXIT
+          trap 'rm -f "$key" "$RUNNER_TEMP/bmds-apps.pub"' EXIT
           (umask 077 && printf '%s\n' "$BMDS_APPS_KEY" > "$key")
+          # The public half beside it, where the SDK's bmds_add_package() looks (KEY's stem .pub).
+          cp keys/bmds-apps.pub "$RUNNER_TEMP/bmds-apps.pub"
           pre=""
           case "$TAG" in *-*) pre=--prerelease ;; esac
           python3 tools/release --key "$key" --publish $pre --repo "$GITHUB_REPOSITORY" "$TAG"
