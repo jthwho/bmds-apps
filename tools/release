@@ -93,7 +93,7 @@ def main():
     if o.publish:
         notes = "bmds-apps %s: %s.\n\nAdd this repository to BMDS once:\n\n" \
                 "    pkg source add https://github.com/%s/releases/latest/download\n" % (
-                    o.tag, ", ".join(n[:-5] for n in files if n.endswith(".bmpk")), o.repo)
+                    o.tag, ", ".join(n[:-5].replace("_", " ", 1) for n in files if n.endswith(".bmpk")), o.repo)
         command = ["gh", "release", "create", o.tag, "--repo", o.repo, "--verify-tag", "--title",
                    "bmds-apps " + o.tag, "--notes", notes]
         if o.prerelease:

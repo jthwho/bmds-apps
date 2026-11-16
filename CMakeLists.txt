@@ -5,10 +5,10 @@
 #   cmake --build build          # build/repository/: index.bmpi, the packages, key.pub
 cmake_minimum_required(VERSION 3.20)
 
-# The SDK: a BMDS release's (pinned here), or a checkout's with -DBMDS_SDK_DIR. Not released yet:
-# until a BMDS release carries bmds-sdk-VERSION.tar.gz, build with -DBMDS_SDK_DIR.
-set(BMDS_SDK_VERSION "" CACHE STRING "")
-set(BMDS_SDK_SHA256 "" CACHE STRING "")
+# The SDK: a BMDS release's (pinned here: its bmds-sdk-VERSION.tar.gz and that file's SHA-256 from
+# the release's SHA256SUMS), or a checkout's with -DBMDS_SDK_DIR.
+set(BMDS_SDK_VERSION "0.3.1" CACHE STRING "")
+set(BMDS_SDK_SHA256 "d96cffc9a2972fb14287821a6cd9a73362189753f3067e70fc3fd0a47b5d96c0" CACHE STRING "")
 include(cmake/sdk.cmake)
 
 project(bmds-apps C ASM)

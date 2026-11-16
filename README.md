@@ -50,9 +50,6 @@ release pinned in `CMakeLists.txt` (`BMDS_SDK_VERSION`, `BMDS_SDK_SHA256`), chec
 hash. To build against a BMDS checkout instead (a newer SDK, or BMDS's own development), give
 `-DBMDS_SDK_DIR=<bmds>/sdk`.
 
-> **Not released yet:** no BMDS release carries the SDK tarball yet, so until one does, the pin
-> is empty and `-DBMDS_SDK_DIR` is needed.
-
     cmake -S . -B build -G Ninja -DBMDS_KEY=$HOME/.config/bmds/bmds-apps.key
     cmake --build build
 
