@@ -31,6 +31,8 @@ ap.add_argument('--bpp16', action='store_true')
 ap.add_argument('--skip', action='store_true', help='parse updates without decoding them (speed tests)')
 ap.add_argument('--seconds', type=float, default=0, help='then ask for updates this long and report the rate')
 ap.add_argument('--cut', help='text to copy (ClientCutText, Latin-1) after the first update')
+ap.add_argument('--cursor', action='store_true',
+                help='the Cursor pseudo-encoding: the viewer draws the pointer (its shapes printed)')
 ap.add_argument('--ext-clip', action='store_true',
                 help='the Extended Clipboard (UTF-8): --cut is announced, sent when asked for')
 ap.add_argument('--watch-cut', type=float, default=0, help='then print the server\'s cut texts this long')
@@ -93,6 +95,7 @@ encs = {'raw': [0], 'zrle': [16], 'tight': [7]}[a.enc] + [-224, -223]
 if a.quality >= 0: encs.append(-32 + a.quality)
 if a.compress >= 0: encs.append(-256 + a.compress)
 if a.ext_clip: encs.append(-1063131698)  # 0xC0A1E5CE
+if a.cursor: encs.append(-239)
 s.sendall(struct.pack('>BxH', 2, len(encs)) + b''.join(struct.pack('>i', e) for e in encs))
 
 fb = Image.new('RGB', (W, H))
@@ -129,6 +132,11 @@ def rect():
     global W, H, fb
     x, y, w, h, e = struct.unpack('>HHHHi', rx(12))
     stats[e] = stats.get(e, 0) + 1
+    if e == -239:
+        d = rx(w * h * bpp); m = rx((w + 7) // 8 * h)
+        shown = sum(bin(b).count('1') for b in m)
+        print('cursor %dx%d hot %d,%d: %d pixels shown' % (w, h, x, y, shown), flush=True)
+        return True
     if a.skip and e not in (-224, -223):
         skip_rect(x, y, w, h, e); return True
     if e == -224: return False

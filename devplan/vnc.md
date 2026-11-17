@@ -487,3 +487,24 @@ Measured on bmds0 with `-v`'s new per-update times (capture, JPEG, zlib, encode)
   with the session going on. A viewer without it still gets Latin-1 both ways. **Not tried:**
   TigerVNC itself.
 
+
+## 24. The pointer drawn by the viewer (2026-11-17, step 5: RFB's Cursor; BMDS's vnc.md §20)
+
+- **What:** a viewer that lists the Cursor pseudo-encoding (-239; TigerVNC, Remmina, noVNC do) gets
+  the pointer's picture as a Cursor rectangle and draws it itself, at once as its mouse moves; its
+  captures leave the pointer out (`BMDS_CAPTURE_NO_POINTER`), so it isn't shown twice.
+- **The picture:** one copy for all viewers, fetched on the loop (`ScreenShare.pointerShape()`)
+  after a `pointerChanged`, and only while the worker is idle (it reads the copy), numbered. A
+  viewer whose number is behind gets it at the start of its next update; a viewer asking for an
+  update gets one for the picture alone, when nothing else changed. Opaque where alpha is half or
+  more (RFB's mask); 0 × 0 when the board shows none.
+- **Taking it up or letting it go** (a SetEncodings): the whole screen sent again (the pointer moves
+  between the pixels and the viewer's drawing).
+- **A BMDS before it:** `pointerShape` is tried at the start; if it fails, no viewer gets Cursor and
+  the pointer stays in the pixels, as before.
+- **Tried on bmds0** with `tools/vncview.py --cursor` (new): the arrow (12 × 19) with the first
+  update; the pointer moved to 640, 400, the picture there was the wallpaper (with the pointer in
+  the pixels instead: the arrow's 118 pixels); sweeping over a window brought the edge arrows.
+  **Not tried:** TigerVNC or Remmina drawing it.
+- **Next:** PointerPos (-232), for a viewer to follow the board's own mouse; RFB's cursor with
+  alpha (-314, TigerVNC) for a drag's soft-edged image.

@@ -509,3 +509,43 @@ TEST_CASE("Extended Clipboard: the viewer's messages, and Latin-1 for the rest")
         CHECK_FALSE(Session::writeCutTextFromUtf8(full, "hello", 5));
         CHECK(full.size() == 0);
 }
+
+TEST_CASE("Cursor: the pointer's pixels in the viewer's format, and its mask") {
+        std::vector<uint8_t> buffer(256);
+        Writer               w(buffer.data(), buffer.size());
+        // 9 × 2: opaque red, clear, half-clear green (taken), then a row of opaque blue.
+        uint32_t argb[18] = {};
+        argb[0] = 0xffff0000u;
+        argb[1] = 0x00ffffffu;
+        argb[8] = 0x8000ff00u;
+        for (int x = 0; x < 9; ++x) argb[9 + x] = 0xff0000ffu;
+        vnc::PixelFormat rgb565;
+        rgb565.bitsPerPixel = 16;
+        rgb565.depth = 16;
+        rgb565.redMax = 31;
+        rgb565.greenMax = 63;
+        rgb565.blueMax = 31;
+        rgb565.redShift = 11;
+        rgb565.greenShift = 5;
+        rgb565.blueShift = 0;
+        REQUIRE(Session::writeCursor(w, rgb565, 9, 2, 3, 1, argb));
+        // The header: the hot spot as x, y; 9 × 2; -239.
+        REQUIRE(w.size() == 12 + 9 * 2 * 2 + 2 * 2);
+        CHECK(std::vector<uint8_t>(buffer.begin(), buffer.begin() + 12) == hex("0003000100090002ffffff11"));
+        CHECK(vnc::readU16(&buffer[12]) == 0x00f8);         // red, little-endian 0xf800
+        CHECK(vnc::readU16(&buffer[12 + 8 * 2]) == 0xe007); // green
+        CHECK(vnc::readU16(&buffer[12 + 9 * 2]) == 0x1f00); // blue
+        const uint8_t *mask = &buffer[12 + 36];
+        CHECK(mask[0] == 0x80); // the first pixel; the second clear
+        CHECK(mask[1] == 0x80); // the ninth, half-clear: shown
+        CHECK(mask[2] == 0xff);
+        CHECK(mask[3] == 0x80);
+        // No pointer: 0 × 0, the header alone.
+        w.clear();
+        REQUIRE(Session::writeCursor(w, rgb565, 0, 0, 0, 0, nullptr));
+        CHECK(w.size() == 12);
+        // Too little room: nothing written.
+        Writer small(buffer.data(), 20);
+        CHECK_FALSE(Session::writeCursor(small, rgb565, 9, 2, 3, 1, argb));
+        CHECK(small.size() == 0);
+}

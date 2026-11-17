@@ -109,6 +109,8 @@ namespace vnc {
                         void         workerLoop();
                         void         giveInput(Viewer *v, bool chosen); // null: nobody's (None when @p chosen)
                         void         guiEvents();
+                        void         refreshCursor(); // the pointer's picture fetched, if it changed (worker idle)
+                        void         applyEncodings(Viewer *v); // its SetEncodings to its encoder (worker idle)
                         void         clipboardEvent(const bmds_gui_event_t &e); // the board's copies
                         // A viewer's clipboard messages (devplan/vnc.md §19, §23), sent between its updates.
                         enum class Clip : uint8_t {
@@ -153,6 +155,18 @@ namespace vnc {
                         int32_t     _outputId = -1;    // display/output's sysconf id
                         int         _outputWatch = -1; // its watch: the item follows changes made elsewhere
                         bool        _blank = false;    // display/output is remote
+                        // The pointer's picture for viewers drawing it themselves (devplan/vnc.md §24):
+                        // fetched on the loop while the worker is idle (it reads it), numbered.
+                        uint32_t *_cursor = nullptr; // 0xAARRGGBB
+                        uint16_t  _cursorWidth = 0;
+                        uint16_t  _cursorHeight = 0;
+                        uint16_t  _cursorHotX = 0;
+                        uint16_t  _cursorHotY = 0;
+                        uint32_t  _cursorSerial = 0;   // 0: none fetched yet
+                        bool      _cursorStale = true; // pointerChanged since the last fetch
+                        // The system says the pointer's picture and leaves it out of captures: false on a
+                        // BMDS before it (probed at the start, devplan/vnc.md §24): no viewer gets Cursor.
+                        bool        _cursorAble = false;
                         int         _listen = -1;
                         uint16_t    _width = 0; // the screen, as last captured (a new viewer's ServerInit)
                         uint16_t    _height = 0;

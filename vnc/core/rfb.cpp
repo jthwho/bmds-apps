@@ -325,6 +325,28 @@ namespace vnc {
                 return;
         }
 
+        bool Session::writeCursor(Writer &out, const PixelFormat &format, uint16_t width, uint16_t height,
+                                  uint16_t hotX, uint16_t hotY, const uint32_t *argb) {
+                const size_t start = out.size();
+                const size_t bpp = format.bytesPerPixel();
+                const size_t maskRow = (size_t(width) + 7) / 8;
+                writeRectHeader(out, hotX, hotY, width, height, Encoding::Cursor);
+                uint8_t *pixels = out.reserve(size_t(width) * height * bpp);
+                uint8_t *mask = out.reserve(maskRow * height);
+                if (out.overflowed()) {
+                        out.truncate(start);
+                        return false;
+                }
+                std::memset(mask, 0, maskRow * height);
+                for (uint16_t y = 0; y < height; ++y)
+                        for (uint16_t x = 0; x < width; ++x) {
+                                const uint32_t p = argb[size_t(y) * width + x];
+                                format.storePixel(p & 0xffffffu, pixels + (size_t(y) * width + x) * bpp);
+                                if ((p >> 24) >= 0x80) mask[size_t(y) * maskRow + x / 8] |= uint8_t(0x80u >> (x % 8));
+                        }
+                return true;
+        }
+
         void Session::writeBell(Writer &out) {
                 out.u8(2);
                 return;

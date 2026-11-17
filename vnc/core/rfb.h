@@ -175,6 +175,16 @@ namespace vnc {
                         /** @brief The pseudo-rectangle ending an update sent with 0xffff rectangles. */
                         static void writeLastRect(Writer &out);
 
+                        /**
+                         * @brief The Cursor pseudo-rectangle (RFB 3.8 §7.8.1): the pointer's picture for
+                         *        the viewer to draw itself, @p argb's @p width × @p height 0xAARRGGBB
+                         *        pixels (opaque where alpha is half or more), its tip at @p hotX,
+                         *        @p hotY. 0 × 0: no pointer shown.
+                         * @return False if it didn't fit (nothing written).
+                         */
+                        static bool writeCursor(Writer &out, const PixelFormat &format, uint16_t width, uint16_t height,
+                                                uint16_t hotX, uint16_t hotY, const uint32_t *argb);
+
                         /** @brief Bell. */
                         static void writeBell(Writer &out);
 

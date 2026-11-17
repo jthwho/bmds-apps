@@ -112,6 +112,11 @@ namespace vnc {
                         bool     requestPending = false; // ask for its copy (it said it has one)
                         bool     providePending = false; // it asked for the board's copy
                         bool     notifyPending = false;  // it peeked: say what the board has
+                        // The Cursor pseudo-encoding (devplan/vnc.md §24): asked for, in use (its
+                        // captures without the pointer), and the picture it has.
+                        bool     wantsCursor = false;
+                        bool     cursor = false;
+                        uint32_t cursorSent = 0;
                         unsigned refused = 0;        // injections the system refused (the first few logged)
                         // The viewer's SetPixelFormat and SetEncodings while the worker encodes: kept,
                         // and given to the encoder before the next job.
@@ -153,6 +158,7 @@ namespace vnc {
                 while (_viewerCount > 0) drop(_viewers[_viewerCount - 1], "the server stopped");
                 stopWorker();
                 free(_cut);
+                free(_cursor);
                 free(_pixels);
                 const int pipes[] = {_jobPipe[0], _jobPipe[1], _donePipe[0], _donePipe[1]};
                 for (int fd : pipes)
@@ -254,6 +260,12 @@ namespace vnc {
                         return 1;
                 }
                 _inputShare = bmds_screen_share_new(_gui, 0); // the viewers' input goes through it
+                {
+                        // A BMDS before the pointer's picture (devplan/vnc.md §24): no viewer gets Cursor.
+                        bmds_gui_value_t shape = {};
+                        _cursorAble =
+                                _inputShare != 0 && bmds_screen_share_pointer_shape(_gui, _inputShare, &shape) == 0;
+                }
                 // One capture buffer for all viewers, on BMDS_CAPTURE_ALIGN: the kernel's 2D-DMA fills it.
                 void *pixels = nullptr;
                 if (posix_memalign(&pixels, BMDS_CAPTURE_ALIGN, CaptureBytes) != 0) {
@@ -269,6 +281,7 @@ namespace vnc {
                                        BMDS_GUI_CLIPBOARD_PASTED,
                                        BMDS_GUI_SCREEN_SHARE_CHANGED,
                                        BMDS_GUI_NOTIFICATION_ACTIVATED,
+                                       BMDS_GUI_SCREEN_SHARE_POINTER_CHANGED,
                                        "clipboard",
                                        "primary"};
                 uint32_t    atoms[sizeof(names) / sizeof(names[0])] = {};
@@ -335,6 +348,7 @@ namespace vnc {
                         if (_viewerCount > 0) place();
                         for (size_t i = 0; i < _viewerCount; ++i) startTls(_viewers[i]);
                         for (size_t i = 0; i < _viewerCount; ++i) flushClipboard(_viewers[i]);
+                        refreshCursor();
                         startUpdate();
                         (void)bmds_gui_flush(_gui);
                         // The GUI, the listener, the worker's answers, display/output's watch, the viewers.
@@ -421,6 +435,9 @@ namespace vnc {
                                 if (e.source == v->screen &&
                                     bmds_gui_event_is(_gui, &e, BMDS_GUI_SCREEN_SHARE_CHANGED)) {
                                         v->changed = true;
+                                } else if (e.source == v->screen &&
+                                           bmds_gui_event_is(_gui, &e, BMDS_GUI_SCREEN_SHARE_POINTER_CHANGED)) {
+                                        _cursorStale = true;
                                 } else if (e.source == v->notification &&
                                            bmds_gui_event_is(_gui, &e, BMDS_GUI_NOTIFICATION_ACTIVATED) &&
                                            e.count == 1 && e.values[0].number == 0) {
@@ -726,13 +743,20 @@ namespace vnc {
                 bmds_screen_capture_t c = {};
                 c.size = sizeof(c);
                 c.format = BMDS_PIXEL_BGR24;
-                c.flags = all ? BMDS_CAPTURE_ALL : 0;
+                c.flags = (all ? BMDS_CAPTURE_ALL : 0) | (v->cursor ? BMDS_CAPTURE_NO_POINTER : 0);
                 c.buffer = _pixels;
                 c.capacity = uint32_t(captureBytes(v));
                 c.rects = v->rects;
                 c.max_rects = MaxRects;
                 c.share = v->screen;
-                const int32_t r = bmds_gui_screen_capture(bmds_gui_fd(_gui), &c);
+                int32_t r = bmds_gui_screen_capture(bmds_gui_fd(_gui), &c);
+                if (r == -BMDS_EINVAL && v->cursor) {
+                        // A BMDS without captures leaving the pointer out (start() said it had them):
+                        // the screen's pointer it is, for this viewer.
+                        v->cursor = false;
+                        c.flags &= ~BMDS_CAPTURE_NO_POINTER;
+                        r = bmds_gui_screen_capture(bmds_gui_fd(_gui), &c);
+                }
                 if (r == -BMDS_EACCES) return 0; // the watch isn't there yet: its changed will come
                 if (r < 0) return -1;
                 v->rectCount = c.rect_count;
@@ -778,9 +802,10 @@ namespace vnc {
                                 v->encoder.setPixelFormat(v->format);
                                 v->bytesPerPixel = v->format.bytesPerPixel();
                         }
-                        if (v->pendingEncodings) v->encoder.setEncodings(v->encodings, v->encodingCount);
+                        if (v->pendingEncodings) applyEncodings(v);
                         v->pendingFormat = v->pendingEncodings = false;
-                        if (v->full || v->changed || v->more || (v == _pixelsOwner && v->hasLeftover())) {
+                        const bool cursorDue = v->cursor && _cursorSerial != 0 && v->cursorSent != _cursorSerial;
+                        if (v->full || v->changed || v->more || cursorDue || (v == _pixelsOwner && v->hasLeftover())) {
                                 pick = v;
                                 _nextServed = (_nextServed + k + 1) % _viewerCount;
                         }
@@ -790,7 +815,7 @@ namespace vnc {
                         pick->encoder.setPixelFormat(pick->format);
                         pick->bytesPerPixel = pick->format.bytesPerPixel();
                 }
-                if (pick->pendingEncodings) pick->encoder.setEncodings(pick->encodings, pick->encodingCount);
+                if (pick->pendingEncodings) applyEncodings(pick);
                 pick->pendingFormat = pick->pendingEncodings = false;
                 const bool leftover = pick == _pixelsOwner && pick->hasLeftover();
                 if (!leftover && _pixelsOwner != nullptr && _pixelsOwner->hasLeftover()) {
@@ -807,6 +832,55 @@ namespace vnc {
                 _busy = true;
                 const char job = 'u';
                 if (write(_jobPipe[1], &job, 1) != 1) _busy = false;
+                return;
+        }
+
+        // A viewer's SetEncodings given to its encoder (the worker idle), and the Cursor taken up
+        // or let go: its picture then changes (the pointer drawn by the viewer, or in the pixels), so
+        // everything is sent again.
+        void Server::applyEncodings(Viewer *v) {
+                v->encoder.setEncodings(v->encodings, v->encodingCount);
+                const bool cursor = v->wantsCursor && _cursorAble;
+                if (cursor != v->cursor) {
+                        v->cursor = cursor;
+                        v->cursorSent = 0;
+                        v->full = true;
+                }
+                return;
+        }
+
+        // The pointer's picture fetched after pointerChanged, while no job reads it (devplan/vnc.md
+        // §24): little-endian width, height, hot spot, then 0xAARRGGBB pixels.
+        void Server::refreshCursor() {
+                if (!_cursorStale || _busy || !_cursorAble) return;
+                bool wanted = false;
+                for (size_t i = 0; i < _viewerCount; ++i) wanted = wanted || _viewers[i]->wantsCursor;
+                if (!wanted) return;
+                _cursorStale = false;
+                bmds_gui_value_t v = {};
+                if (bmds_screen_share_pointer_shape(_gui, _inputShare, &v) != 0 || v.length < 8)
+                        return; // the next change
+                const auto *b = reinterpret_cast<const uint8_t *>(v.text);
+                const auto  u16 = [b](size_t at) {
+                        return uint16_t(b[at] | b[at + 1] << 8);
+                };
+                const uint16_t w = u16(0), h = u16(2);
+                const size_t   pixels = size_t(w) * h;
+                if (v.length != 8 + pixels * 4) return;
+                if (pixels > size_t(_cursorWidth) * _cursorHeight || _cursor == nullptr) {
+                        free(_cursor);
+                        _cursor = static_cast<uint32_t *>(malloc(pixels > 0 ? pixels * 4 : 4));
+                        if (_cursor == nullptr) return;
+                }
+                for (size_t i = 0; i < pixels; ++i) {
+                        const uint8_t *p = b + 8 + i * 4;
+                        _cursor[i] = uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
+                }
+                _cursorWidth = w;
+                _cursorHeight = h;
+                _cursorHotX = u16(4);
+                _cursorHotY = u16(6);
+                if (++_cursorSerial == 0) _cursorSerial = 1;
                 return;
         }
 
@@ -854,6 +928,14 @@ namespace vnc {
                         v->height = v->capturedHeight;
                         v->session.setSize(v->width, v->height);
                         Session::writeDesktopSize(out, v->width, v->height);
+                        ++count;
+                }
+                // The pointer's picture, if it changed since the viewer's last (read while the loop
+                // leaves it be: a job runs).
+                if (v->cursor && _cursorSerial != 0 && v->cursorSent != _cursorSerial &&
+                    Session::writeCursor(out, v->encoder.pixelFormat(), _cursorWidth, _cursorHeight, _cursorHotX,
+                                         _cursorHotY, _cursor)) {
+                        v->cursorSent = _cursorSerial;
                         ++count;
                 }
                 const uint8_t *pixels = _pixels;
@@ -1053,6 +1135,9 @@ namespace vnc {
                 v->encodingCount = count < 64 ? count : 64;
                 for (size_t i = 0; i < v->encodingCount; ++i) v->encodings[i] = encodings[i];
                 v->pendingEncodings = true;
+                v->wantsCursor = false;
+                for (size_t i = 0; i < count; ++i)
+                        if (encodings[i] == Encoding::Cursor) v->wantsCursor = true;
                 // The Extended Clipboard: our caps after each SetEncodings asking for it (the spec).
                 for (size_t i = 0; i < count; ++i)
                         if (encodings[i] == Encoding::ExtendedClipboard) {
