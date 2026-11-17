@@ -69,7 +69,7 @@ The rules' tests run on the PC, with the PC's compiler (C and C++, under the san
     cmake -S tests -B build-tests && cmake --build build-tests && ctest --test-dir build-tests
 
 Configured with clang (`CC=clang CXX=clang++`), `tests/` builds the fuzzers too (libFuzzer):
-`irc_message_fuzz CORPUS-DIR`.
+`irc_message_fuzz CORPUS-DIR` and `irc_session_fuzz CORPUS-DIR`.
 
 ### Trying it on a board
 

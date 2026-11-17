@@ -5,9 +5,10 @@ network.md §35, step 6, after TLS for programs). In bmds-apps, released after t
 release, which brings what it needs: TLS sockets (`tls_ctl`, network.md §35) and `ChatView`
 (BMDS's `devplan/chatview.md`). **Approved as proposed** 2026-11-16 (§11).
 
-Status: **step 0's `ChatView` built in BMDS** (its chatview.md §7-§9), its tabs' additions
-designed (its tabs.md, for review); **step 1 built** (§12), the core's first part (`message`)
-with it. Paths below are this repository's unless they name BMDS.
+Status: **step 0 built in BMDS** (`ChatView`: its chatview.md §7-§9; the tabs' additions: its
+tabs.md §7-§9); **step 1 built** (§12); **step 2's first part built** (§13: containers,
+ISUPPORT, formatting, the session); its second part (buffers, commands, completion) next.
+Paths below are this repository's unless they name BMDS.
 
 ## 1. Goal
 
@@ -200,8 +201,8 @@ A network's login (`networks.ini`, `login=`), as mIRC's server settings offer:
   sends `NickServ VERIFY REGISTER nick code`. Done, the password is stored and the network's login
   set to `sasl`, so the next connection logs in before joining.
 - **A nick that is ours but taken** (`433`, a password stored): we take a fallback nick, send
-  `NickServ RECOVER nick password` (Atheme's and Anope's; `GHOST` on services that lack it),
-  and change to the nick when it is free.
+  `NickServ GHOST nick password` (Atheme's, Libera's, and OFTC's services all have it; `RECOVER`
+  isn't on OFTC's), and send `NICK nick` once NickServ answers (or after 2 s).
 - **`/ns` and `/cs`** send to NickServ and ChanServ (`/msg NickServ ...` works too); their
   notices go to the network's tab, not a private chat of their own. A notice asking us to
   identify, when we have a password and haven't, identifies (once a connection).
@@ -298,3 +299,61 @@ there until curses comes to the SDK.
 - **Tested:** 14 cases, 164 checks (CR LF injection, the 512-byte edge, splits that join back,
   a byte at a time, the longest line and one byte more). The fuzzer, 5 minutes on three workers
   (5 million runs each, 289 edges): nothing after the command fix.
+
+## 13. Step 2, first part, built (2026-11-17)
+
+The core's containers, ISUPPORT, formatting and one network's session (§3, §7), tested on the PC;
+`irc_core` built for the board (`-O2`: 39 KB, 30 KB of it the session).
+
+- **`str.h`:** `String` and `Vector<T>` (the board has no libstdc++): move only, growth reported
+  as `NoMem` rather than thrown. `Error` moved to `text.h` and gained `NoMem`, `NotFound`,
+  `Invalid`. GCC's `-O2` saw a possible overflow in an inlined `append()` (it can't prove a
+  `reserve()` succeeded): the growth is in `str.cpp`, with an explicit size-overflow check.
+- **`isupport.h`:** casemapping (`ascii`, `rfc1459`, `strict-rfc1459`; `sameName()`), and
+  `Isupport` from `005`: `CASEMAPPING`, `NETWORK`, `CHANTYPES`, `PREFIX`, `CHANMODES` (which modes
+  take a parameter), `-TOKEN` back to the default, `STATUSMSG` prefixes taken off a target.
+  Fixed sizes: no allocation.
+- **`format.h`:** mIRC's codes stripped (for logs, notifications, mentions; `ChatView` draws them
+  as they come), UTF-8 checked and Latin-1 read when a line isn't, CTCP parsed, a mention as a
+  word of its own under the casemapping, `server-time` read, base64 for SASL.
+- **`session.h`:** `Session` takes lines, time (`Now`: a monotonic clock for timers, the wall's
+  for what is shown) and the user's actions, and gives lines (`takeLine()`) and events
+  (`takeEvent()`); the platform polls by `sendWaitMs()` and `tickWaitMs()`, so nothing spins.
+  - Registration: `PASS` for `login=password`; `CAP LS 302` (continued lines gathered), a `REQ`
+    of the wanted caps offered (§1's, and `sasl` with a login); SASL PLAIN in 400-byte pieces
+    (a `+` after an exact multiple) or EXTERNAL; `CAP END` after `903`, a refusal or a `NAK`;
+    `NICK`/`USER`. A refused SASL is told (`LoginFailed`) and falls back to NickServ.
+  - After `001`: our nick ghosted and taken back if a fallback was needed (§7a); `IDENTIFY` for
+    `login=nickserv` (and a failed SASL), the joins waiting for NickServ's answer or 10 s; the
+    settings' channels (`#chan key` too) and those of the last connection joined.
+  - A taken nick while registering: the alternates, then `_` added (three times), then three
+    digits.
+  - Lines out: registration and `PONG` first and unpaced; the rest paced, 5 at once then one a
+    second. On a lost connection the lines the user typed are kept for the next one, the rest
+    dropped, and the channels remembered for joining again.
+  - Keeping it up: our `PING` after 90 s quiet (the lag from its `PONG`), `Timeout` after 210 s.
+  - Channels and members: our joins make a channel; `NAMES` (multi-prefix) fills it, a new one
+    replacing it; `MODE` walks its modes with their parameters (`CHANMODES`) and keeps prefixes
+    in rank order; nick changes, parts, quits, kicks, `away-notify`, `extended-join` (account
+    and real name), `chghost`.
+  - Events name their buffer: a channel, a person (`Query`: a private chat, and our own echoed
+    message named for whom it was to), or `""` (the network's: server notices, numerics, a
+    person's notice to us, services' notices flagged `Service`). Quits and nick changes come once
+    a channel and once for a private chat with the person.
+  - Messages: CTCP `ACTION` as a flag, `VERSION` and `PING` answered, the rest ignored;
+    `STATUSMSG` targets (`@#chan`) to the channel; text read as UTF-8 or Latin-1; times from
+    `server-time`. Our own messages shown at once without `echo-message`, by the echo with it;
+    a long one split at words into lines that fit with the server's `:nick!user@host` added (a
+    63-byte host assumed until the server shows ours).
+  - Refused: a line break or NUL in anything typed, a target with a space or comma, nothing
+    to say.
+- **Tested:** 40 cases, 841 checks: containers (moves counted: nothing leaked), casemapping,
+  ISUPPORT, the formatting; the session against scripted servers: registration with and without
+  CAP, LS over two lines, SASL PLAIN and its pieces, SASL refused then NickServ, NickServ never
+  answering, `PASS`, the nick chain and a ghosted nick retaken, NAMES and modes, nick changes,
+  away, parts, quits, kicks, extended-join, messages, CTCP, STATUSMSG, server notices, Latin-1,
+  sending with and without `echo-message`, a long message split, refusals, pacing with `PONG`
+  first, PING and lag and the timeout, a lost connection's typed line and rejoin, ERROR, the
+  reconnect delays. `irc_session_fuzz` (the server's lines, the user's, time and reconnects
+  from the input): 3 minutes on three workers, about 2.4 million runs each, 1413 edges; every
+  line sent one line within 512 bytes, every event's text UTF-8; nothing found.

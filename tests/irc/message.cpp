@@ -8,23 +8,14 @@
  * IRC's messages (irc/core/message.h): parsed, built, split and cut from bytes.
  */
 
+#include "helpers.h"
 #include "message.h"
-
-#include <doctest.h>
 
 #include <string>
 #include <vector>
 
 using irc::Error;
 using irc::Text;
-
-namespace doctest {
-        template <> struct StringMaker<Text> {
-                        static String convert(Text text) {
-                                return String("\"") + String(text.data(), String::size_type(text.size())) + "\"";
-                        }
-        };
-} // namespace doctest
 
 namespace {
 

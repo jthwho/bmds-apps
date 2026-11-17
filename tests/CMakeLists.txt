@@ -3,7 +3,8 @@
 #
 #   cmake -S tests -B build-tests && cmake --build build-tests && ctest --test-dir build-tests
 #
-# Under clang (CC=clang CXX=clang++ cmake ...), the fuzzers too (libFuzzer): irc_message_fuzz.
+# Under clang (CC=clang CXX=clang++ cmake ...), the fuzzers too (libFuzzer): irc_message_fuzz,
+# irc_session_fuzz.
 cmake_minimum_required(VERSION 3.16)
 project(bmds-apps-tests C CXX)
 set(CMAKE_C_STANDARD 11)
@@ -20,12 +21,12 @@ add_test(NAME field COMMAND field_test)
 # IRC's core as the board builds it: no exceptions or RTTI, and only C's headers and the
 # freestanding C++ ones (the board has no libstdc++).
 set(IRC_CORE ${CMAKE_CURRENT_LIST_DIR}/../irc/core)
-set(IRC_CORE_SRCS ${IRC_CORE}/message.cpp)
+set(IRC_CORE_SRCS ${IRC_CORE}/message.cpp ${IRC_CORE}/str.cpp ${IRC_CORE}/isupport.cpp ${IRC_CORE}/format.cpp ${IRC_CORE}/session.cpp)
 add_library(irc_core STATIC ${IRC_CORE_SRCS})
 target_include_directories(irc_core PUBLIC ${IRC_CORE})
 target_compile_options(irc_core PRIVATE -fno-exceptions -fno-rtti)
 
-add_executable(irc_test irc/main.cpp irc/message.cpp)
+add_executable(irc_test irc/main.cpp irc/message.cpp irc/str.cpp irc/format.cpp irc/session.cpp)
 target_include_directories(irc_test PRIVATE ../thirdparty/doctest)
 target_compile_definitions(irc_test PRIVATE DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS)
 target_compile_options(irc_test PRIVATE -fno-exceptions -fno-rtti)
@@ -55,4 +56,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         target_include_directories(irc_message_fuzz PRIVATE ${IRC_CORE})
         target_compile_options(irc_message_fuzz PRIVATE -g -O1 -fsanitize=fuzzer)
         target_link_options(irc_message_fuzz PRIVATE -fsanitize=fuzzer)
+        add_executable(irc_session_fuzz irc/session_fuzz.cpp ${IRC_CORE_SRCS})
+        target_include_directories(irc_session_fuzz PRIVATE ${IRC_CORE})
+        target_compile_options(irc_session_fuzz PRIVATE -g -O1 -fsanitize=fuzzer)
+        target_link_options(irc_session_fuzz PRIVATE -fsanitize=fuzzer)
 endif()

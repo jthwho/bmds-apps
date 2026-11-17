@@ -14,6 +14,16 @@
 
 namespace irc {
 
+        /** @brief What the core's functions return (devplan/irc.md §3). */
+        enum class Error : uint8_t {
+                Ok,
+                Malformed, ///< Not a message, or a parameter that can't be sent (a CR, LF, NUL...).
+                TooLong,   ///< Past a line's limit.
+                NoMem,     ///< Out of memory.
+                NotFound,  ///< No such channel, member, or thing.
+                Invalid,   ///< Not allowed now, or not a valid argument.
+        };
+
         /**
          * @brief Bytes someone else keeps: a view of a line, a parameter, a name (no terminating
          *        NUL). The core's string type, as the board has no libstdc++ (no `std::string_view`).

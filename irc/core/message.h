@@ -15,13 +15,6 @@
 
 namespace irc {
 
-        /** @brief What the core's functions return (devplan/irc.md §3). */
-        enum class Error : uint8_t {
-                Ok,
-                Malformed, ///< Not a message, or a parameter that can't be sent (a CR, LF, NUL...).
-                TooLong,   ///< Past a line's limit.
-        };
-
         /** @brief A message's source, `nick!user@host` (a server's: its name, in `nick`). */
         struct Source {
                         Text nick;
