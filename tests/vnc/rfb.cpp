@@ -549,3 +549,15 @@ TEST_CASE("Cursor: the pointer's pixels in the viewer's format, and its mask") {
         CHECK_FALSE(Session::writeCursor(small, rgb565, 9, 2, 3, 1, argb));
         CHECK(small.size() == 0);
 }
+
+TEST_CASE("Cursor With Alpha: Raw, R G B A, the colours multiplied by alpha") {
+        std::vector<uint8_t> buffer(64);
+        Writer               w(buffer.data(), buffer.size());
+        const uint32_t       argb[2] = {0xff102030u, 0x80ff8000u};
+        REQUIRE(Session::writeCursorWithAlpha(w, 2, 1, 1, 0, argb));
+        CHECK(std::vector<uint8_t>(buffer.data(), buffer.data() + w.size()) ==
+              hex("0001000000020001fffffec600000000102030ff80400080"));
+        Writer small(buffer.data(), 20);
+        CHECK_FALSE(Session::writeCursorWithAlpha(small, 2, 1, 1, 0, argb));
+        CHECK(small.size() == 0);
+}

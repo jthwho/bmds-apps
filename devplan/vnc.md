@@ -508,3 +508,19 @@ Measured on bmds0 with `-v`'s new per-update times (capture, JPEG, zlib, encode)
   **Not tried:** TigerVNC or Remmina drawing it.
 - **Next:** PointerPos (-232), for a viewer to follow the board's own mouse; RFB's cursor with
   alpha (-314, TigerVNC) for a drag's soft-edged image.
+
+## 25. The board's pointer followed, and soft cursors (2026-11-17; BMDS's vnc.md §21)
+
+- **Pointer position:** a viewer with Cursor that lists a pointer-position pseudo-encoding gets a
+  0 × 0 rectangle at the board's pointer when it moved since the last told: -232 (libvnc's, so
+  Remmina's, and TightVNC's; rfbproto lists it without defining it) or VMware's (0x574d5666,
+  TigerVNC's, defined there), whichever it lists first. The place comes with each capture (BMDS's
+  `pointer_x`, `pointer_y`), so it is the frame's. Not sent while the viewer's own mouse moves
+  (500 ms): its place a little behind would pull its pointer back, and a watching viewer's mouse
+  would be taken from it. A viewer's own pointer event counts as told.
+- **Cursor With Alpha** (-314, TigerVNC): listed, it is sent instead of Cursor: Raw, R, G, B, A
+  bytes, the colours multiplied by alpha, so a drag's image keeps its soft edges. (The number is
+  from memory of TigerVNC; rfbproto's section names no number.)
+- **Tried on bmds0** with `tools/vncview.py --pointer-pos tight|vmware --alpha` (new): a watching
+  viewer got the input viewer's sweep, 93 and 95 positions in 4 s; the moving viewer got one (before
+  it moved); the arrow came as 118 opaque pixels with alpha. **Not tried:** TigerVNC, Remmina.

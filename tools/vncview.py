@@ -33,6 +33,9 @@ ap.add_argument('--seconds', type=float, default=0, help='then ask for updates t
 ap.add_argument('--cut', help='text to copy (ClientCutText, Latin-1) after the first update')
 ap.add_argument('--cursor', action='store_true',
                 help='the Cursor pseudo-encoding: the viewer draws the pointer (its shapes printed)')
+ap.add_argument('--alpha', action='store_true', help='with --cursor: Cursor With Alpha (-314) asked for too')
+ap.add_argument('--pointer-pos', choices=['tight', 'vmware'],
+                help='where the board\'s pointer is (PointerPos -232, or VMware\'s), printed')
 ap.add_argument('--ext-clip', action='store_true',
                 help='the Extended Clipboard (UTF-8): --cut is announced, sent when asked for')
 ap.add_argument('--watch-cut', type=float, default=0, help='then print the server\'s cut texts this long')
@@ -96,6 +99,8 @@ if a.quality >= 0: encs.append(-32 + a.quality)
 if a.compress >= 0: encs.append(-256 + a.compress)
 if a.ext_clip: encs.append(-1063131698)  # 0xC0A1E5CE
 if a.cursor: encs.append(-239)
+if a.cursor and a.alpha: encs.insert(0, -314)
+if a.pointer_pos: encs.append(-232 if a.pointer_pos == 'tight' else 0x574d5666)
 s.sendall(struct.pack('>BxH', 2, len(encs)) + b''.join(struct.pack('>i', e) for e in encs))
 
 fb = Image.new('RGB', (W, H))
@@ -132,6 +137,15 @@ def rect():
     global W, H, fb
     x, y, w, h, e = struct.unpack('>HHHHi', rx(12))
     stats[e] = stats.get(e, 0) + 1
+    if e in (-232, 0x574d5666):
+        print('pointer at %d,%d' % (x, y), flush=True)
+        return True
+    if e == -314:
+        if struct.unpack('>i', rx(4))[0] != 0: raise SystemExit('cursor with alpha: not raw?')
+        d = rx(w * h * 4)
+        print('cursor with alpha %dx%d hot %d,%d: %d opaque, %d partly' % (w, h, x, y,
+              sum(1 for i in range(3, len(d), 4) if d[i] == 255), sum(1 for i in range(3, len(d), 4) if 0 < d[i] < 255)), flush=True)
+        return True
     if e == -239:
         d = rx(w * h * bpp); m = rx((w + 7) // 8 * h)
         shown = sum(bin(b).count('1') for b in m)

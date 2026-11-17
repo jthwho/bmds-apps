@@ -347,6 +347,26 @@ namespace vnc {
                 return true;
         }
 
+        bool Session::writeCursorWithAlpha(Writer &out, uint16_t width, uint16_t height, uint16_t hotX, uint16_t hotY,
+                                           const uint32_t *argb) {
+                const size_t start = out.size();
+                writeRectHeader(out, hotX, hotY, width, height, Encoding::CursorWithAlpha);
+                out.s32(Encoding::Raw);
+                uint8_t *p = out.reserve(size_t(width) * height * 4);
+                if (out.overflowed()) {
+                        out.truncate(start);
+                        return false;
+                }
+                for (size_t i = 0; i < size_t(width) * height; ++i, p += 4) {
+                        const uint32_t v = argb[i], a = v >> 24;
+                        p[0] = uint8_t(((v >> 16) & 0xff) * a / 255);
+                        p[1] = uint8_t(((v >> 8) & 0xff) * a / 255);
+                        p[2] = uint8_t((v & 0xff) * a / 255);
+                        p[3] = uint8_t(a);
+                }
+                return true;
+        }
+
         void Session::writeBell(Writer &out) {
                 out.u8(2);
                 return;

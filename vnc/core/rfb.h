@@ -26,6 +26,9 @@ namespace vnc {
                 inline constexpr int32_t DesktopSize = -223;
                 inline constexpr int32_t LastRect = -224;
                 inline constexpr int32_t Cursor = -239;
+                inline constexpr int32_t PointerPos = -232; // libvnc's, TightVNC's (unspecified: a 0 × 0 rectangle)
+                inline constexpr int32_t VmwareCursorPosition = 0x574d5666; // TigerVNC's: the same rectangle
+                inline constexpr int32_t CursorWithAlpha = -314;
                 inline constexpr int32_t ExtendedClipboard = int32_t(0xC0A1E5CE); // clipboard.h
                 inline constexpr int32_t QualityLevel0 = -32;   // to -23: 0-9
                 inline constexpr int32_t CompressLevel0 = -256; // to -247: 0-9
@@ -184,6 +187,15 @@ namespace vnc {
                          */
                         static bool writeCursor(Writer &out, const PixelFormat &format, uint16_t width, uint16_t height,
                                                 uint16_t hotX, uint16_t hotY, const uint32_t *argb);
+
+                        /**
+                         * @brief The Cursor With Alpha pseudo-rectangle (rfbproto, TigerVNC): as
+                         *        `writeCursor()`, its pixels Raw as R, G, B, A bytes, the colours
+                         *        multiplied by alpha (soft edges kept).
+                         * @return False if it didn't fit (nothing written).
+                         */
+                        static bool writeCursorWithAlpha(Writer &out, uint16_t width, uint16_t height, uint16_t hotX,
+                                                         uint16_t hotY, const uint32_t *argb);
 
                         /** @brief Bell. */
                         static void writeBell(Writer &out);

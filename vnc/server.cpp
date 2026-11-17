@@ -47,6 +47,7 @@ namespace vnc {
                 constexpr size_t      OutBytes = 384 * 1024;     // an update at most (a 2048-wide band's worst case)
                 constexpr size_t      CaptureBytes = 256 * 1024; // a capture's pixels (a 2048-wide tile row at least)
                 constexpr uint32_t    MaxRects = 64;
+                constexpr uint64_t    PointerStillMs = 500;     // a viewer's mouse still this long: PointerPos again
                 constexpr uint16_t    BandRows = 16;            // a rectangle is encoded in bands of these
                 constexpr uint32_t    MaxRectsAnUpdate = 60000; // under the header's 16 bits
                 constexpr uint32_t    FailuresAllowed = 3;      // wrong passwords from one address
@@ -115,8 +116,18 @@ namespace vnc {
                         // The Cursor pseudo-encoding (devplan/vnc.md §24): asked for, in use (its
                         // captures without the pointer), and the picture it has.
                         bool     wantsCursor = false;
+                        bool     wantsAlpha = false; // Cursor With Alpha (TigerVNC): sent instead
                         bool     cursor = false;
                         uint32_t cursorSent = 0;
+                        // PointerPos (devplan/vnc.md §25): where the board's pointer is, for a viewer
+                        // drawing it (Cursor), so it follows the board's own mouse.
+                        int32_t  wantsPointerPos = 0; // the encoding it listed for it (0: none)
+                        bool     pointerPos = false;
+                        int32_t  boardX = -1; // in its last capture (-1: none drawn)
+                        int32_t  boardY = -1;
+                        int32_t  posSentX = -1;
+                        int32_t  posSentY = -1;
+                        uint64_t movedMs = 0;        // its own last pointer event
                         unsigned refused = 0;        // injections the system refused (the first few logged)
                         // The viewer's SetPixelFormat and SetEncodings while the worker encodes: kept,
                         // and given to the encoder before the next job.
@@ -749,6 +760,7 @@ namespace vnc {
                 c.rects = v->rects;
                 c.max_rects = MaxRects;
                 c.share = v->screen;
+                c.pointer_x = c.pointer_y = -2; // a BMDS before them leaves these
                 int32_t r = bmds_gui_screen_capture(bmds_gui_fd(_gui), &c);
                 if (r == -BMDS_EINVAL && v->cursor) {
                         // A BMDS without captures leaving the pointer out (start() said it had them):
@@ -763,6 +775,8 @@ namespace vnc {
                 v->rectAt = 0;
                 v->bandAt = 0;
                 v->more = c.more != 0;
+                v->boardX = c.pointer_x >= 0 ? c.pointer_x : -1;
+                v->boardY = c.pointer_x >= 0 ? c.pointer_y : -1;
                 v->capturedWidth = uint16_t(c.width);
                 v->capturedHeight = uint16_t(c.height);
                 size_t at = 0;
@@ -841,6 +855,7 @@ namespace vnc {
         void Server::applyEncodings(Viewer *v) {
                 v->encoder.setEncodings(v->encodings, v->encodingCount);
                 const bool cursor = v->wantsCursor && _cursorAble;
+                v->pointerPos = cursor && v->wantsPointerPos != 0;
                 if (cursor != v->cursor) {
                         v->cursor = cursor;
                         v->cursorSent = 0;
@@ -933,10 +948,26 @@ namespace vnc {
                 // The pointer's picture, if it changed since the viewer's last (read while the loop
                 // leaves it be: a job runs).
                 if (v->cursor && _cursorSerial != 0 && v->cursorSent != _cursorSerial &&
-                    Session::writeCursor(out, v->encoder.pixelFormat(), _cursorWidth, _cursorHeight, _cursorHotX,
-                                         _cursorHotY, _cursor)) {
+                    (v->wantsAlpha ? Session::writeCursorWithAlpha(out, _cursorWidth, _cursorHeight, _cursorHotX,
+                                                                   _cursorHotY, _cursor)
+                                   : Session::writeCursor(out, v->encoder.pixelFormat(), _cursorWidth, _cursorHeight,
+                                                          _cursorHotX, _cursorHotY, _cursor))) {
                         v->cursorSent = _cursorSerial;
                         ++count;
+                }
+                // Where the board's pointer went, if it moved. Not to a viewer moving its mouse now
+                // (its own place, a little behind, would pull its pointer back; a watching one's
+                // would be taken from it): once its mouse is still.
+                const bool moving = nowMs() - v->movedMs < PointerStillMs;
+                if (v->pointerPos && v->boardX >= 0 && (v->boardX != v->posSentX || v->boardY != v->posSentY) &&
+                    !moving) {
+                        Session::writeRectHeader(out, uint16_t(v->boardX), uint16_t(v->boardY), 0, 0,
+                                                 v->wantsPointerPos);
+                        if (!out.overflowed()) {
+                                v->posSentX = v->boardX;
+                                v->posSentY = v->boardY;
+                                ++count;
+                        }
                 }
                 const uint8_t *pixels = _pixels;
                 while (v->rectAt < v->rectCount && count < MaxRectsAnUpdate) {
@@ -1135,9 +1166,16 @@ namespace vnc {
                 v->encodingCount = count < 64 ? count : 64;
                 for (size_t i = 0; i < v->encodingCount; ++i) v->encodings[i] = encodings[i];
                 v->pendingEncodings = true;
-                v->wantsCursor = false;
-                for (size_t i = 0; i < count; ++i)
-                        if (encodings[i] == Encoding::Cursor) v->wantsCursor = true;
+                v->wantsCursor = v->wantsAlpha = false;
+                v->wantsPointerPos = 0;
+                for (size_t i = 0; i < count; ++i) {
+                        const int32_t e = encodings[i];
+                        if (e == Encoding::Cursor) v->wantsCursor = true;
+                        if (e == Encoding::CursorWithAlpha) v->wantsCursor = v->wantsAlpha = true;
+                        if ((e == Encoding::PointerPos || e == Encoding::VmwareCursorPosition) &&
+                            v->wantsPointerPos == 0)
+                                v->wantsPointerPos = e;
+                }
                 // The Extended Clipboard: our caps after each SetEncodings asking for it (the spec).
                 for (size_t i = 0; i < count; ++i)
                         if (encodings[i] == Encoding::ExtendedClipboard) {
@@ -1175,6 +1213,9 @@ namespace vnc {
                 const uint8_t pressed = uint8_t(buttons & ~v->buttons);
                 const int     wheel = ((pressed & 0x08) ? 1 : 0) - ((pressed & 0x10) ? 1 : 0);
                 v->buttons = buttons;
+                v->movedMs = nowMs();
+                v->posSentX = x; // where its pointer is (its own drawing): no need to tell it
+                v->posSentY = y;
                 const int32_t px = x < v->width ? x : int32_t(v->width) - 1;
                 const int32_t py = y < v->height ? y : int32_t(v->height) - 1;
                 const int     r = bmds_screen_share_inject_pointer(_server._gui, _server._inputShare, px, py,
