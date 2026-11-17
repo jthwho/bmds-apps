@@ -524,3 +524,16 @@ Measured on bmds0 with `-v`'s new per-update times (capture, JPEG, zlib, encode)
 - **Tried on bmds0** with `tools/vncview.py --pointer-pos tight|vmware --alpha` (new): a watching
   viewer got the input viewer's sweep, 93 and 95 positions in 4 s; the moving viewer got one (before
   it moved); the arrow came as 118 opaque pixels with alpha. **Not tried:** TigerVNC, Remmina.
+
+## 26. Remmina, tried (2026-11-17)
+
+- **Remmina 1.4.43** (libvncclient), the user's bmds0 profile (VeNCrypt, TLS errors ignored)
+  with the test password: connected, the picture right. It lists, in order: Tight, ZRLE, 9,
+  -65527, CopyRect, 5, 6, 4, 2, Raw, compression 2 (-254), quality 7 (-25), XCursor (-240), Cursor
+  (-239), PointerPos (-232), -131072, DesktopSize, LastRect, -131071 to -131069, -309. So -232
+  is its pointer position (as §25 had it from memory); no Extended Clipboard (its copies are
+  Latin-1), no Cursor With Alpha. It lists CopyRect: BMDS's vnc.md §24 would help it.
+- **Not seen:** whether its pointer follows the board's. Remmina draws the pointer as its window's
+  own cursor, shown only while the mouse is over it, so nothing on the screen shows it.
+- **`-v` logs each viewer's SetEncodings** (new), for the next viewer tried.
+- **Not tried yet:** TigerVNC (not installed here).

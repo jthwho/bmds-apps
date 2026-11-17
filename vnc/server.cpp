@@ -1168,6 +1168,12 @@ namespace vnc {
                 v->pendingEncodings = true;
                 v->wantsCursor = v->wantsAlpha = false;
                 v->wantsPointerPos = 0;
+                if (_server._settings.verbose) {
+                        // What a viewer asks for, as it lists it (a real viewer's choices, -v).
+                        fprintf(stderr, "%s: encodings", v->name);
+                        for (size_t i = 0; i < count; ++i) fprintf(stderr, " %ld", long(encodings[i]));
+                        fprintf(stderr, "\n");
+                }
                 for (size_t i = 0; i < count; ++i) {
                         const int32_t e = encodings[i];
                         if (e == Encoding::Cursor) v->wantsCursor = true;
