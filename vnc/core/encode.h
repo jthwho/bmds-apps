@@ -33,7 +33,15 @@ namespace vnc {
                         ZStream &operator=(const ZStream &) = delete;
 
                         /** @brief Compresses @p n bytes at @p in, flushed to a byte boundary, onto @p out. @return False if it didn't fit. */
-                        bool compress(const uint8_t *in, size_t n, int level, Writer &out);
+                        bool compress(const uint8_t *in, size_t n, int level, Writer &out) {
+                                return compress(in, n, level, false, out);
+                        }
+
+                        /**
+                         * @brief As above, @p runs choosing zlib's `Z_RLE` strategy (runs only, no matches
+                         *        searched: several times faster, as good on palette indices).
+                         */
+                        bool compress(const uint8_t *in, size_t n, int level, bool runs, Writer &out);
 
                         /** @brief Forgets the stream (a viewer told to reset it starts a new one). */
                         void end();
@@ -43,6 +51,7 @@ namespace vnc {
                 private:
                         z_stream_s *_z = nullptr;
                         int         _level = -1;
+                        bool        _runs = false;
         };
 
         /** @brief Encodes a rectangle of pixels as JPEG, into @p out: the bytes, or -1 (the board's hardware codec). */
@@ -69,15 +78,22 @@ namespace vnc {
                                         uint32_t raw = 0;
                                         uint64_t pixels = 0;
                                         uint64_t bytes = 0;
+                                        uint64_t zlibUs = 0;   ///< In zlib.
+                                        uint64_t encodeUs = 0; ///< In encode() in all (zlib's and the JPEG's too).
                         };
 
                         /** @brief A rectangle's pixels at most before Tight splits it (libvncserver's at its best levels). */
-                        static constexpr uint32_t TightMaxPixels = 65536;
+                        static constexpr uint32_t TightMaxPixels = 32768; // the encoder's buffers are 4 bytes each
                         static constexpr uint16_t TightMaxWidth = 2048;
 
                         /** @brief Rectangles this narrow or short are never JPEGs (their headers outweigh them). */
                         static constexpr uint16_t JpegMinWidth = 64;
-                        static constexpr uint16_t JpegMinHeight = 32;
+                        static constexpr uint16_t JpegMinHeight = 16; // a block row: 1280-wide pieces are 16 rows
+
+                        /** @brief Tight rectangles this big are searched for solid areas (libvncserver's sizes). */
+                        static constexpr uint32_t SolidSearchPixels = 4096;
+                        /** @brief A solid area this big goes as a fill, the rest around it encoded apart. */
+                        static constexpr uint32_t SolidMinPixels = 2048;
 
                         Encoder();
                         ~Encoder();
@@ -142,6 +158,10 @@ namespace vnc {
 
                 private:
                         size_t encodeTight(const Picture &picture, uint16_t x, uint16_t y, Writer &out);
+                        size_t tightSolids(const Picture &picture, uint16_t x, uint16_t y, Writer &out); // fills first
+                        bool   isSolid(const Picture &picture, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                       uint32_t rgb) const;
+                        bool   tightFill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t rgb, Writer &out);
                         bool   tightRect(const Picture &picture, uint16_t x, uint16_t y, Writer &out);
                         bool   tightPalette(const Picture &picture, size_t colours, Writer &out);
                         bool   tightBasic(const Picture &picture, Writer &out);
@@ -150,9 +170,12 @@ namespace vnc {
                         void   tightControl(Writer &out, uint8_t control); // with the streams to reset
                         bool   zrle(const Picture &picture, uint16_t x, uint16_t y, Writer &out);
                         bool   raw(const Picture &picture, uint16_t x, uint16_t y, Writer &out);
-                        size_t countColours(const Picture &picture, size_t limit); // into _palette; limit + 1 if more
-                        static size_t jpegRoom(size_t pixels);                     // a JPEG's bytes at most
+                        // Into _palette, at most @p limit (limit + 1: more); each pixel's index into @p indices if given.
+                        size_t        countColours(const Picture &picture, size_t limit, uint8_t *indices = nullptr);
+                        static size_t jpegRoom(size_t pixels); // a JPEG's bytes at most
                         uint8_t       indexOf(uint32_t rgb) const;
+                        // Each pixel of row @p row's palette index into @p out (the palette made).
+                        void indexRow(const Picture &picture, uint16_t row, uint8_t *out) const;
 
                         PixelFormat _format;
                         int32_t     _encoding = 0; // Encoding::Raw

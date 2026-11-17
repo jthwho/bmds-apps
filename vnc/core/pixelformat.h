@@ -89,6 +89,15 @@ namespace vnc {
                         /** @brief Writes @p rgb as a TPIXEL. */
                         void storeTpixel(uint32_t rgb, uint8_t *out) const;
 
+                        /**
+                         * @brief Returns true for the usual 32-bit format (little-endian, 8 bits a channel,
+                         *        red at 16): a PIXEL is the screen's B, G, R and a zero, a CPIXEL its B, G, R.
+                         */
+                        bool isBgrx() const {
+                                return bitsPerPixel == 32 && !bigEndian && redMax == 255 && greenMax == 255 &&
+                                       blueMax == 255 && redShift == 16 && greenShift == 8 && blueShift == 0;
+                        }
+
                         /** @brief Returns true if @p other is the same format. */
                         bool operator==(const PixelFormat &other) const;
         };

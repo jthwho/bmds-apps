@@ -290,3 +290,97 @@ normal urgency, that the session isn't encrypted. Tried on bmds0: Tight with JPE
 user had changed `vnc/listen` under a running server and couldn't connect: the settings are read
 at the start). The pid file's second line is now the address the server bound, and `status` says
 that.
+
+## 14. One icon, and Blank Display While Connected (2026-11-16, the user's ask)
+
+- **One icon:** the server's own; while a viewer is in, BMDS draws its red dot on it (BMDS's
+  vnc.md §13), and the system's separate display icon no longer shows.
+- **Blank Display While Connected**, a checkbox in the tray's menu. BMDS has this behaviour
+  already as `display/output` = `remote` (off while a program watches; the server watches only
+  while a viewer is in), so the item is that setting rather than a second one that would fight
+  it: checked sets `remote`, unchecked `on`, saved either way; a watch on the setting keeps the
+  check right when it changes elsewhere (Settings, `sysconf`).
+- **Tried on bmds0:** clicking it with a viewer in turned the HDMI dark at once (and saved
+  `remote`); the display came back as the viewer left; the check followed `sysconf setdef` from
+  the shell.
+
+## 15. No setting to add (2026-11-16)
+
+BMDS's `ScreenShare` (its vnc.md §14) takes any local program: the server uses it in place of
+`Shell` and no longer asks for `gui/shell-clients`, so `pkg install vncserver` then `vncserver`
+works, from the desktop, `autoexec.sh` or SSH. The tray's red dot on the server's icon is what
+tells the user the screen is watched. Tried on bmds0 with `gui/shell-clients` empty.
+
+## 16. Speed, first round (2026-11-16, the user's ask)
+
+Measured on bmds0 with `-v`'s new per-update times (capture, JPEG, zlib, encode) and
+`tools/vncview.py --skip --seconds N` (parsing without decoding, so the viewer isn't the limit).
+
+- **Where the time was:** not the hardware JPEG (15 ms for 260K pixels), but the CPU: per-pixel
+  conversion through `Picture::rgb()` and `PixelFormat`'s generic stores, a palette searched for
+  every pixel, and two passes over the captured pixels (in PSRAM) for a palette; then zlib.
+- **Done:**
+  - Row pointers and the last colour's answer kept; the colours counted and indexed in one pass
+    (the indices are the palette's data as they come); two colours packed in place.
+  - Fast paths for the usual 32-bit format (`PixelFormat::isBgrx()`): Raw's pixels a byte
+    shuffle, ZRLE's raw tiles a `memcpy` (its CPIXEL is the screen's B, G, R), Tight's 24-bit
+    pixels a byte swap.
+  - zlib's `Z_RLE` strategy on Tight's palette streams (indices are runs).
+- **Measured, the board idle:** a whole 1280x720 desktop in three updates, about 290 ms on the
+  server (340 before); Raw 49 ms a megabyte (112). An update of 260K pixels of desktop is now
+  about 20 ms capturing, 40-70 ms in zlib, 25-35 ms the rest; JPEG areas about 45 ms a megabyte.
+- **Under load it is the core, not the code:** a terminal scrolling flat out gave 2 updates a
+  second. The server had 31 % of a core: the loader placed it on core 1 when the board was idle,
+  and the scrolling shell and the terminal took core 1 too, while core 0 was half idle.
+- **Next, by what they would win:** the capture by 2D-DMA in the kernel (20 ms a megabyte of CPU,
+  under the window manager's lock); choosing the core (or a second thread on the other one) when
+  the board is busy; CompressLevel 0 as zlib's stored blocks (a LAN carries an uncompressed
+  palette faster than zlib makes one: 260 KB is 22 ms at 100 Mbit/s); Tight's large solid areas
+  split out as fills before the palette (libvncserver's), so a mostly flat rectangle isn't a
+  byte a pixel through zlib.
+
+## 17. A worker on the less busy core (2026-11-16, the user's go-ahead on §16's first two)
+
+- **The worker:** a thread captures and encodes each update; the main thread keeps the sockets,
+  the GUI and input. A job at a time, through two pipes (the loop's `startUpdate()`, the worker's
+  `buildUpdate()`, the loop's `updateDone()`). The viewer's SetPixelFormat and SetEncodings are
+  held and given to the encoder before the next job, so the threads never share it; `drop()`
+  waits for a job under way.
+- **Its core:** it pins itself first thing, in an entry with no floating point or PIE (either fixes
+  a thread's core), as libbmdsgame's audio threads do. At the start, the less busy core over 200 ms
+  (`cpu.coreN.busy_us`); then every 3 s, the cores' load against its own share: moved (a new
+  thread, the old one ended) when the other core, the worker aside, is 20 points less busy.
+- **The capture buffer** is on `BMDS_CAPTURE_ALIGN`, so BMDS's 2D-DMA copies into it (its vnc.md
+  §15): a megabyte in 7-10 ms (21 by the CPU).
+- **Measured on bmds0:** with a terminal scrolling flat out on core 1, the worker went to core 0
+  and had 85 % of it; when Doom then loaded core 0, it moved itself to core 1. Updates of the
+  scrolling terminal 2.4 a second (2.0): the limit is now zlib, about 200 ms an update for 400 KB of
+  palette indices, on a core of its own.
+- **Found: memory.** Doom (8.4 MB) and a viewer (about 2.5 MB: the update and capture buffers, 1 MB
+  each, the encoder's 512 KB) left PSRAM's largest block at 2.4 MB; a second viewer's buffers then
+  couldn't be had and it was closed at once, and SSH logins failed (internal RAM down to 7 KB, from
+  the game). Smaller buffers are the next thing (§9).
+- **Next for speed:** zlib: CompressLevel 0 as stored blocks for a fast network, and Tight's large
+  solid areas as fills before a palette (§16).
+
+## 18. Smaller buffers, solid areas, compression level 0 (2026-11-16, the user's go-ahead)
+
+- **Memory:** the update buffer 384 KB (1 MB), the capture buffer 768 KB (1 MB), Tight's largest
+  piece 32K pixels (64K), so the encoder's two buffers 128 KB each: about 1.5 MB with a viewer
+  (2.6), measured. JPEG's least height is 16 rows (32): 1280-wide pieces are 16 rows now.
+- **Solid areas** (`tightSolids()`, libvncserver's sizes): a Tight rectangle of 4K pixels or more
+  is searched on a 16-pixel grid for a solid block, grown right then down; 2K pixels or more go as
+  a fill and the four rectangles around it are encoded the same way. A test of a terminal-shaped
+  picture (text on the left, dark elsewhere) checks the fills and that it decodes exactly. A whole
+  idle desktop is now 67 KB at level 6.
+- **CompressLevel 0** is zlib's stored blocks already (`deflateInit2` at level 0): nothing to add.
+- **Measured on bmds0,** a terminal scrolling flat out, the server's throughput (pixels sent over
+  its time): with the 384 KB capture buffer tried first, 1.11 Mpixel/s at level 6 (the 1 MB one
+  gave about 1.2): each capture pays about 35 ms under that load (the window manager's round and
+  the frame), more often with smaller captures. With 768 KB: **1.38 Mpixel/s at level 6** (59 KB a
+  Mpixel sent), **2.60 at level 0** (596 KB a Mpixel: 0.6 MB/s, nothing on a LAN). The solid areas
+  don't help this case (`ls -l` fills most lines); they do on desktops and editors.
+- **Next:** the capture's wait under load (§9); a viewer's own choice of level stays its own.
+- **Then the capture's wait** (BMDS's vnc.md §16): the desktop's latest present copied without the
+  window manager's lock; a capture under load 11 ms (21-33); scrolling 4.5 Mpixel/s at level 0,
+  2.5 at level 6, nothing changed here.

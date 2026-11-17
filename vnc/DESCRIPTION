@@ -9,7 +9,5 @@ then point a viewer at localhost:5900. Set a password with 'vncserver passwd'. W
 vnc/listen at lan (and a password) it listens on the network too, but VNC isn't encrypted there:
 the tunnel is the safer way. Start it with
 'vncserver' (from autoexec.sh, or over SSH); 'vncserver stop' ends it. While it runs it has an
-icon in the tray, and a viewer coming or going shows a notification.
-
-The program must be named in the setting gui/shell-clients (Settings > Desktop) to see the
-screen and type into it.
+icon in the tray (a red dot on it while a viewer is in), and a viewer coming or going shows a
+notification.

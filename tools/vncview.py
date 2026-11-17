@@ -19,21 +19,26 @@ ap.add_argument('--host', default='127.0.0.1')
 ap.add_argument('--port', type=int, default=5900)
 ap.add_argument('--enc', choices=['raw', 'zrle', 'tight'], default='tight')
 ap.add_argument('--quality', type=int, default=-1)
+ap.add_argument('--compress', type=int, default=-1, help='CompressLevel 0-9 (none: the server picks)')
 ap.add_argument('--out', default='vnc.png')
 ap.add_argument('--password')
 ap.add_argument('--type')
 ap.add_argument('--updates', type=int, default=1)
 ap.add_argument('--bpp16', action='store_true')
+ap.add_argument('--skip', action='store_true', help='parse updates without decoding them (speed tests)')
+ap.add_argument('--seconds', type=float, default=0, help='then ask for updates this long and report the rate')
 a = ap.parse_args()
 
 s = socket.create_connection((a.host, a.port), timeout=30)
+received = [0]
 def rx(n):
-    b = b''
+    b = bytearray()
     while len(b) < n:
-        c = s.recv(n - len(b))
+        c = s.recv(min(n - len(b), 1 << 20))
         if not c: raise SystemExit('closed after %d of %d bytes' % (len(b), n))
         b += c
-    return b
+    received[0] += n
+    return bytes(b)
 def u8(): return rx(1)[0]
 def u16(): return struct.unpack('>H', rx(2))[0]
 def u32(): return struct.unpack('>I', rx(4))[0]
@@ -59,6 +64,7 @@ if a.bpp16:
     s.sendall(b'\x00\0\0\0' + struct.pack('>BBBBHHHBBB3x', 16, 16, 0, 1, 31, 63, 31, 11, 5, 0))
 encs = {'raw': [0], 'zrle': [16], 'tight': [7]}[a.enc] + [-224, -223]
 if a.quality >= 0: encs.append(-32 + a.quality)
+if a.compress >= 0: encs.append(-256 + a.compress)
 s.sendall(struct.pack('>BxH', 2, len(encs)) + b''.join(struct.pack('>i', e) for e in encs))
 
 fb = Image.new('RGB', (W, H))
@@ -74,10 +80,29 @@ def clen():
         if b & 0x80: n |= u8() << 14
     return n
 stats = {}
+def skip_rect(x, y, w, h, e):
+    tpx = 3 if bpp == 4 else 2
+    if e == 0: rx(w * h * bpp)
+    elif e == 16: rx(u32())
+    elif e == 7:
+        c = u8() & 0xf0
+        if c == 0x80: rx(tpx)
+        elif c == 0x90: rx(clen())
+        else:
+            pal = 0
+            if c & 0x40:
+                rx(1); pal = u8() + 1; rx(pal * tpx)
+            rowb = (w + 7) // 8 if pal == 2 else w if pal else w * tpx
+            want = rowb * h
+            rx(want) if want < 12 else rx(clen())
+    else: raise SystemExit('encoding %d?' % e)
+
 def rect():
     global W, H, fb
     x, y, w, h, e = struct.unpack('>HHHHi', rx(12))
     stats[e] = stats.get(e, 0) + 1
+    if a.skip and e not in (-224, -223):
+        skip_rect(x, y, w, h, e); return True
     if e == -224: return False
     if e == -223:
         W, H = w, h; fb = Image.new('RGB', (W, H)); return True
@@ -158,5 +183,11 @@ if a.type:
     time.sleep(1.0)
 for i in range(a.updates - 1):
     stats.clear(); dt = update(1); print('incremental update in %.2f s, %s' % (dt, stats))
-fb.save(a.out)
+if a.seconds > 0:
+    received[0] = 0; n = 0; t0 = time.time()
+    while time.time() - t0 < a.seconds:
+        update(1); n += 1
+    dt = time.time() - t0
+    print('%d updates in %.1f s: %.1f a second, %.2f MB/s' % (n, dt, n / dt, received[0] / dt / 1e6))
+if not a.skip: fb.save(a.out)
 s.close()

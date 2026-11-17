@@ -459,3 +459,29 @@ TEST_CASE("Tight: a rectangle that didn't fit resets the streams, and the viewer
         for (int y = 0; y < 200; ++y) changed.set(y, y, 0xff00ff);
         roundTrip(changed, e, v, true);
 }
+
+TEST_CASE("Tight: solid areas go as fills, the rest around them, exactly") {
+        // A terminal: a dark background, lines of coloured text down its left part.
+        Screen s(800, 480);
+        for (int y = 0; y < 480; ++y)
+                for (int x = 0; x < 800; ++x) {
+                        uint32_t c = 0x101010;
+                        if (y < 200 && x < 420 && (y / 16) % 2 == 0 && (x * 7 + y * 3) % 11 < 4)
+                                c = (x / 40) % 3 == 0 ? 0x30c030 : (x / 40) % 3 == 1 ? 0xe0e0e0 : 0x4060ff;
+                        s.set(x, y, c);
+                }
+        auto run = [&](uint32_t &bytes, uint32_t &fills) {
+                Encoder e;
+                REQUIRE(e.init(Encoder::TightMaxPixels));
+                const int32_t list[] = {vnc::Encoding::Tight, vnc::Encoding::LastRect};
+                e.setEncodings(list, 2);
+                Viewer v(800, 480);
+                roundTrip(s, e, v, true);
+                bytes = uint32_t(e.stats().bytes);
+                fills = e.stats().fills;
+        };
+        uint32_t bytes = 0, fills = 0;
+        run(bytes, fills);
+        CHECK(fills >= 3);       // the empty right part and the empty bottom, at least
+        CHECK(bytes < 40 * 1024); // the text alone through zlib (800 x 480 would be 375 KB raw)
+}

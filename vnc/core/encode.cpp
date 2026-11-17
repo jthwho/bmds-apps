@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <time.h>
 #include <zlib.h>
 
 namespace vnc {
@@ -59,23 +60,34 @@ namespace vnc {
                         return Quality[level < 0 ? 0 : level > 9 ? 9 : level];
                 }
 
+                uint64_t nowUs() {
+                        struct timespec t;
+                        clock_gettime(CLOCK_MONOTONIC, &t);
+                        return uint64_t(t.tv_sec) * 1000000u + uint64_t(t.tv_nsec) / 1000u;
+                }
+
         } // namespace
 
         // ---- ZStream
 
-        bool ZStream::compress(const uint8_t *in, size_t n, int level, Writer &out) {
+        bool ZStream::compress(const uint8_t *in, size_t n, int level, bool runs, Writer &out) {
+                const int strategy = runs ? Z_RLE : Z_DEFAULT_STRATEGY;
                 if (_z == nullptr) {
                         _z = static_cast<z_stream_s *>(std::calloc(1, sizeof(z_stream_s)));
                         if (_z == nullptr) return false;
-                        if (deflateInit2(_z, level, Z_DEFLATED, WindowBits, MemLevel, Z_DEFAULT_STRATEGY) != Z_OK) {
+                        if (deflateInit2(_z, level, Z_DEFLATED, WindowBits, MemLevel, strategy) != Z_OK) {
                                 std::free(_z);
                                 _z = nullptr;
                                 return false;
                         }
                         _level = level;
-                } else if (level != _level) {
-                        // The stream goes on (the viewer's inflate doesn't care about the level).
-                        if (deflateParams(_z, level, Z_DEFAULT_STRATEGY) == Z_OK) _level = level;
+                        _runs = runs;
+                } else if (level != _level || runs != _runs) {
+                        // The stream goes on (the viewer's inflate doesn't care about either).
+                        if (deflateParams(_z, level, strategy) == Z_OK) {
+                                _level = level;
+                                _runs = runs;
+                        }
                 }
                 _z->next_in = const_cast<Bytef *>(in);
                 _z->avail_in = uInt(n);
@@ -148,7 +160,9 @@ namespace vnc {
                 const size_t pixels = size_t(width) * height;
                 // Tight's pieces each cost a header, a control byte, a palette and zlib's overhead; a
                 // JPEG is held to its pixels' size (jpegRoom()).
-                const size_t pieces = pixels / (TightMaxPixels / 4) + size_t(width) / TightMaxWidth + 2;
+                // Solid areas cut a rectangle into at most four more each, and a fill each.
+                const size_t pieces = pixels / (TightMaxPixels / 4) + size_t(width) / TightMaxWidth + 2 +
+                                      5 * (pixels / SolidMinPixels + 1);
                 return pieces * (12 + 1 + 3 + 256 * 4 + 64) + jpegRoom(pixels) + 64;
         }
 
@@ -158,10 +172,11 @@ namespace vnc {
 
         size_t Encoder::encode(const Picture &picture, uint16_t x, uint16_t y, Writer &out) {
                 if (picture.width == 0 || picture.height == 0 || _broken) return 0;
-                const size_t before = out.size();
-                size_t       rects = 0;
+                const uint64_t started = nowUs();
+                const size_t   before = out.size();
+                size_t         rects = 0;
                 if (_encoding == Encoding::Tight) {
-                        rects = encodeTight(picture, x, y, out);
+                        rects = tightSolids(picture, x, y, out);
                 } else if (_encoding == Encoding::Zrle) {
                         rects = zrle(picture, x, y, out) ? 1 : 0;
                 } else {
@@ -181,23 +196,32 @@ namespace vnc {
                 }
                 _stats.pixels += uint64_t(picture.width) * picture.height;
                 _stats.bytes += out.size() - before;
+                _stats.encodeUs += nowUs() - started;
                 return rects;
         }
 
         // The colours of @p picture into the palette, at most @p limit (limit + 1: more than that).
-        size_t Encoder::countColours(const Picture &picture, size_t limit) {
+        // The hot loops below read pixels off row pointers (B, G, R) rather than `Picture::rgb()`'s
+        // multiply a pixel, and keep the last colour's answer: a desktop's runs are long.
+        size_t Encoder::countColours(const Picture &picture, size_t limit, uint8_t *indices) {
                 _paletteCount = 0;
                 uint32_t last = 0xffffffffu;
+                uint8_t  index = 0;
                 for (uint16_t row = 0; row < picture.height; ++row) {
-                        for (uint16_t col = 0; col < picture.width; ++col) {
-                                const uint32_t c = picture.rgb(col, row);
-                                if (c == last) continue; // runs are common: skip the search
-                                last = c;
-                                bool known = false;
-                                for (size_t i = 0; i < _paletteCount && !known; ++i) known = _palette[i] == c;
-                                if (known) continue;
-                                if (_paletteCount == limit) return limit + 1;
-                                _palette[_paletteCount++] = c;
+                        const uint8_t *p = picture.pixels + size_t(row) * picture.stride;
+                        for (uint16_t col = 0; col < picture.width; ++col, p += 3) {
+                                const uint32_t c = uint32_t(p[2]) << 16 | uint32_t(p[1]) << 8 | p[0];
+                                if (c != last) { // runs are common: the search skipped
+                                        last = c;
+                                        size_t i = 0;
+                                        while (i < _paletteCount && _palette[i] != c) ++i;
+                                        if (i == _paletteCount) {
+                                                if (_paletteCount == limit) return limit + 1;
+                                                _palette[_paletteCount++] = c;
+                                        }
+                                        index = uint8_t(i);
+                                }
+                                if (indices != nullptr) *indices++ = index;
                         }
                 }
                 return _paletteCount;
@@ -209,6 +233,21 @@ namespace vnc {
                 return 0;
         }
 
+        void Encoder::indexRow(const Picture &picture, uint16_t row, uint8_t *out) const {
+                const uint8_t *p = picture.pixels + size_t(row) * picture.stride;
+                uint32_t       last = 0xffffffffu;
+                uint8_t        index = 0;
+                for (uint16_t col = 0; col < picture.width; ++col, p += 3) {
+                        const uint32_t c = uint32_t(p[2]) << 16 | uint32_t(p[1]) << 8 | p[0];
+                        if (c != last) {
+                                last = c;
+                                index = indexOf(c);
+                        }
+                        out[col] = index;
+                }
+                return;
+        }
+
         // ---- Raw
 
         bool Encoder::raw(const Picture &picture, uint16_t x, uint16_t y, Writer &out) {
@@ -216,9 +255,21 @@ namespace vnc {
                 const size_t bpp = _format.bytesPerPixel();
                 uint8_t     *p = out.reserve(size_t(picture.width) * picture.height * bpp);
                 if (p == nullptr) return false;
-                for (uint16_t row = 0; row < picture.height; ++row)
+                const bool bgrx = _format.isBgrx();
+                for (uint16_t row = 0; row < picture.height; ++row) {
+                        const uint8_t *src = picture.pixels + size_t(row) * picture.stride;
+                        if (bgrx) { // the usual: B, G, R as they are, and a zero
+                                for (uint16_t col = 0; col < picture.width; ++col, src += 3, p += 4) {
+                                        p[0] = src[0];
+                                        p[1] = src[1];
+                                        p[2] = src[2];
+                                        p[3] = 0;
+                                }
+                                continue;
+                        }
                         for (uint16_t col = 0; col < picture.width; ++col, p += bpp)
                                 _format.storePixel(picture.rgb(col, row), p);
+                }
                 ++_stats.raw;
                 return true;
         }
@@ -242,7 +293,10 @@ namespace vnc {
                                 const Picture tile = picture.part(tx, ty, tw, th);
                                 // A tile's worst case: raw CPIXELs and its byte.
                                 if (tiles.room() < size_t(tw) * th * cpx + 1 + ZrleMaxPalette * cpx) {
-                                        if (!_zrle.compress(tiles.data(), tiles.size(), _compress, out)) return false;
+                                        const uint64_t z0 = nowUs();
+                                        const bool     ok = _zrle.compress(tiles.data(), tiles.size(), _compress, out);
+                                        _stats.zlibUs += nowUs() - z0;
+                                        if (!ok) return false;
                                         tiles.clear();
                                 }
                                 const size_t colours = countColours(tile, ZrleMaxPalette);
@@ -254,29 +308,45 @@ namespace vnc {
                                         for (size_t i = 0; i < colours; ++i)
                                                 _format.storeCpixel(_palette[i], tiles.reserve(cpx));
                                         const unsigned bits = colours <= 2 ? 1 : colours <= 4 ? 2 : 4;
-                                        for (uint16_t row = 0; row < th; ++row) {
+                                        const size_t   rowBytes = (size_t(tw) * bits + 7) / 8;
+                                        uint8_t       *q = tiles.reserve(rowBytes * th); // room checked above
+                                        uint8_t        indices[ZrleTile];
+                                        for (uint16_t row = 0; row < th; ++row, q += rowBytes) {
+                                                indexRow(tile, row, indices);
                                                 unsigned byte = 0, filled = 0;
+                                                uint8_t *b = q;
                                                 for (uint16_t col = 0; col < tw; ++col) {
-                                                        byte = byte << bits | indexOf(tile.rgb(col, row));
+                                                        byte = byte << bits | indices[col];
                                                         filled += bits;
                                                         if (filled == 8) {
-                                                                tiles.u8(uint8_t(byte));
+                                                                *b++ = uint8_t(byte);
                                                                 byte = 0;
                                                                 filled = 0;
                                                         }
                                                 }
-                                                if (filled != 0) tiles.u8(uint8_t(byte << (8 - filled)));
+                                                if (filled != 0) *b = uint8_t(byte << (8 - filled));
                                         }
                                 } else {
                                         tiles.u8(0);
-                                        uint8_t *p = tiles.reserve(size_t(tw) * th * cpx);
-                                        for (uint16_t row = 0; row < th; ++row)
+                                        uint8_t   *p = tiles.reserve(size_t(tw) * th * cpx);
+                                        const bool bgr = cpx == 3 && _format.isBgrx(); // a CPIXEL is B, G, R
+                                        for (uint16_t row = 0; row < th; ++row) {
+                                                if (bgr) {
+                                                        std::memcpy(p, tile.pixels + size_t(row) * tile.stride,
+                                                                    size_t(tw) * 3);
+                                                        p += size_t(tw) * 3;
+                                                        continue;
+                                                }
                                                 for (uint16_t col = 0; col < tw; ++col, p += cpx)
                                                         _format.storeCpixel(tile.rgb(col, row), p);
+                                        }
                                 }
                         }
                 }
-                if (tiles.size() != 0 && !_zrle.compress(tiles.data(), tiles.size(), _compress, out)) return false;
+                const uint64_t z0 = nowUs();
+                const bool     zok = tiles.size() == 0 || _zrle.compress(tiles.data(), tiles.size(), _compress, out);
+                _stats.zlibUs += nowUs() - z0;
+                if (!zok) return false;
                 const size_t n = out.size() - dataStart;
                 uint8_t     *len = out.data() + lengthAt;
                 len[0] = uint8_t(n >> 24);
@@ -288,6 +358,94 @@ namespace vnc {
         }
 
         // ---- Tight
+
+        // ---- Tight's solid areas (libvncserver's findBestSolidArea, simplified): a big rectangle is
+        // searched on a 16-pixel grid for a solid block; the first is grown right, then down, while it
+        // stays solid; big enough, it goes as one fill and the four rectangles around it (above,
+        // left, right, below) are encoded the same way. A flat area then costs a few bytes rather than
+        // a byte a pixel through zlib.
+
+        bool Encoder::isSolid(const Picture &picture, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                              uint32_t rgb) const {
+                const uint8_t b = uint8_t(rgb), g = uint8_t(rgb >> 8), r = uint8_t(rgb >> 16);
+                for (uint16_t row = 0; row < h; ++row) {
+                        const uint8_t *p = picture.pixels + size_t(y + row) * picture.stride + size_t(x) * 3;
+                        for (uint16_t col = 0; col < w; ++col, p += 3)
+                                if (p[0] != b || p[1] != g || p[2] != r) return false;
+                }
+                return true;
+        }
+
+        bool Encoder::tightFill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t rgb, Writer &out) {
+                Session::writeRectHeader(out, x, y, w, h, Encoding::Tight);
+                tightControl(out, TightFill);
+                uint8_t *p = out.reserve(_format.tpixelBytes());
+                if (p == nullptr) return false;
+                _format.storeTpixel(rgb, p);
+                ++_stats.fills;
+                return true;
+        }
+
+        size_t Encoder::tightSolids(const Picture &picture, uint16_t x, uint16_t y, Writer &out) {
+                const uint16_t w = picture.width, h = picture.height;
+                if (w == 0 || h == 0) return 0;
+                if (uint32_t(w) * h < SolidSearchPixels) return encodeTight(picture, x, y, out);
+                constexpr uint16_t Block = 16;
+                for (uint16_t by = 0; by < h; by = uint16_t(by + Block)) {
+                        const uint16_t bh = uint16_t(h - by < Block ? h - by : Block);
+                        for (uint16_t bx = 0; bx < w; bx = uint16_t(bx + Block)) {
+                                const uint16_t bw = uint16_t(w - bx < Block ? w - bx : Block);
+                                const uint32_t c = picture.rgb(bx, by);
+                                if (!isSolid(picture, bx, by, bw, bh, c)) continue;
+                                // Grown right a block at a time, then down while the whole width holds.
+                                uint16_t x1 = uint16_t(bx + bw);
+                                while (x1 < w) {
+                                        const uint16_t step = uint16_t(w - x1 < Block ? w - x1 : Block);
+                                        if (!isSolid(picture, x1, by, step, bh, c)) break;
+                                        x1 = uint16_t(x1 + step);
+                                }
+                                uint16_t y1 = uint16_t(by + bh);
+                                while (y1 < h) {
+                                        const uint16_t step = uint16_t(h - y1 < Block ? h - y1 : Block);
+                                        if (!isSolid(picture, bx, y1, uint16_t(x1 - bx), step, c)) break;
+                                        y1 = uint16_t(y1 + step);
+                                }
+                                if (uint32_t(x1 - bx) * (y1 - by) < SolidMinPixels) continue;
+                                // Above, left, the fill, right, below.
+                                size_t n = 0;
+                                if (by > 0) {
+                                        const size_t k = tightSolids(picture.part(0, 0, w, by), x, y, out);
+                                        if (k == 0) return 0;
+                                        n += k;
+                                }
+                                if (bx > 0) {
+                                        const size_t k = tightSolids(picture.part(0, by, bx, uint16_t(y1 - by)), x,
+                                                                     uint16_t(y + by), out);
+                                        if (k == 0) return 0;
+                                        n += k;
+                                }
+                                if (!tightFill(uint16_t(x + bx), uint16_t(y + by), uint16_t(x1 - bx), uint16_t(y1 - by),
+                                               c, out))
+                                        return 0;
+                                ++n;
+                                if (x1 < w) {
+                                        const size_t k =
+                                                tightSolids(picture.part(x1, by, uint16_t(w - x1), uint16_t(y1 - by)),
+                                                            uint16_t(x + x1), uint16_t(y + by), out);
+                                        if (k == 0) return 0;
+                                        n += k;
+                                }
+                                if (y1 < h) {
+                                        const size_t k = tightSolids(picture.part(0, y1, w, uint16_t(h - y1)), x,
+                                                                     uint16_t(y + y1), out);
+                                        if (k == 0) return 0;
+                                        n += k;
+                                }
+                                return n;
+                        }
+                }
+                return encodeTight(picture, x, y, out);
+        }
 
         // Split into rectangles Tight takes (TightMaxWidth wide, TightMaxPixels at most; heights in
         // 16s where it can, so a JPEG's blocks stay whole).
@@ -312,7 +470,9 @@ namespace vnc {
 
         bool Encoder::tightRect(const Picture &picture, uint16_t x, uint16_t y, Writer &out) {
                 Session::writeRectHeader(out, x, y, picture.width, picture.height, Encoding::Tight);
-                const size_t colours = countColours(picture, TightMaxPalette);
+                // The indices made as the colours are counted (one pass over the pixels): what a
+                // palette sends.
+                const size_t colours = countColours(picture, TightMaxPalette, _work);
                 if (colours == 1) {
                         tightControl(out, TightFill);
                         _format.storeTpixel(_palette[0], out.reserve(_format.tpixelBytes()));
@@ -341,24 +501,31 @@ namespace vnc {
                 const size_t tpx = _format.tpixelBytes();
                 for (size_t i = 0; i < colours; ++i) _format.storeTpixel(_palette[i], out.reserve(tpx));
                 if (out.overflowed()) return false;
-                Writer data(_work, _workBytes);
-                for (uint16_t row = 0; row < picture.height; ++row) {
-                        if (colours == 2) {
+                // The indices are in the work buffer already (countColours()), a byte a pixel: sent so
+                // for more than two colours; for two, packed to a bit a pixel in place (the packed bytes
+                // are never ahead of the ones read).
+                const size_t pixels = size_t(picture.width) * picture.height;
+                size_t       bytes = pixels;
+                if (colours == 2) {
+                        const size_t   rowBytes = (size_t(picture.width) + 7) / 8;
+                        const uint8_t *in = _work;
+                        for (uint16_t row = 0; row < picture.height; ++row) {
+                                uint8_t *b = _work + size_t(row) * rowBytes;
                                 unsigned byte = 0, filled = 0;
                                 for (uint16_t col = 0; col < picture.width; ++col) {
-                                        byte = byte << 1 | (picture.rgb(col, row) == _palette[1] ? 1u : 0u);
+                                        byte = byte << 1 | *in++;
                                         if (++filled == 8) {
-                                                data.u8(uint8_t(byte));
+                                                *b++ = uint8_t(byte);
                                                 byte = 0;
                                                 filled = 0;
                                         }
                                 }
-                                if (filled != 0) data.u8(uint8_t(byte << (8 - filled)));
-                        } else {
-                                for (uint16_t col = 0; col < picture.width; ++col)
-                                        data.u8(indexOf(picture.rgb(col, row)));
+                                if (filled != 0) *b = uint8_t(byte << (8 - filled));
                         }
+                        bytes = rowBytes * picture.height;
                 }
+                Writer data(_work, _workBytes);
+                (void)data.reserve(bytes);
                 if (data.overflowed() || !tightData(stream, data.data(), data.size(), out)) return false;
                 ++_stats.palettes;
                 return true;
@@ -371,9 +538,20 @@ namespace vnc {
                 Writer       data(_work, _workBytes);
                 uint8_t     *p = data.reserve(size_t(picture.width) * picture.height * tpx);
                 if (p == nullptr) return false;
-                for (uint16_t row = 0; row < picture.height; ++row)
+                const bool tight24 = _format.isTight24();
+                for (uint16_t row = 0; row < picture.height; ++row) {
+                        const uint8_t *src = picture.pixels + size_t(row) * picture.stride;
+                        if (tight24) { // R, G, B: the screen's bytes the other way round
+                                for (uint16_t col = 0; col < picture.width; ++col, src += 3, p += 3) {
+                                        p[0] = src[2];
+                                        p[1] = src[1];
+                                        p[2] = src[0];
+                                }
+                                continue;
+                        }
                         for (uint16_t col = 0; col < picture.width; ++col, p += tpx)
                                 _format.storeTpixel(picture.rgb(col, row), p);
+                }
                 if (!tightData(StreamBasic, data.data(), data.size(), out)) return false;
                 ++_stats.basics;
                 return true;
@@ -411,8 +589,12 @@ namespace vnc {
                         out.bytes(data, n);
                         return !out.overflowed();
                 }
-                Writer packed(_packed, _packedBytes);
-                if (!_tight[stream].compress(data, n, _compress, packed)) return false;
+                Writer         packed(_packed, _packedBytes);
+                const uint64_t z0 = nowUs();
+                // Indices (the palettes' streams) by runs alone: fast, and as good on them.
+                const bool ok = _tight[stream].compress(data, n, _compress, stream != StreamBasic, packed);
+                _stats.zlibUs += nowUs() - z0;
+                if (!ok) return false;
                 compactLength(out, packed.size());
                 out.bytes(packed.data(), packed.size());
                 return !out.overflowed();
