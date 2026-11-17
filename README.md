@@ -36,7 +36,10 @@ and an index signed by any other key is refused.
     keys/bmds-apps.pub      the public half of the signing key (the private half is never here)
     minesweeper/            the game: field.c (rules), draw.c (pictures), main.c (the window),
                             app.desktop, icons/, DESCRIPTION, and its CMakeLists.txt
-    tests/                  the rules' tests, on the PC
+    irc/                    IRC, being built (devplan/irc.md): core/ is its portable C++ core
+    tests/                  the rules' tests, on the PC: Minesweeper's, IRC's core, the fuzzers
+    thirdparty/doctest/     the C++ tests' framework (MIT)
+    devplan/                designs, as BMDS keeps them
     tools/icons.py          draws the game's icons
     tools/release           builds, signs and (with --publish) releases
     .github/workflows/      the release workflow: a tag in, a GitHub release out
@@ -57,9 +60,12 @@ hash. To build against a BMDS checkout instead (a newer SDK, or BMDS's own devel
 `key.pub`. Without `-DBMDS_KEY`, the dev key signs (the build warns): fine for trying on your own
 board, but a source pinned to the bmds-apps key won't take it.
 
-The rules' tests run on the PC, with the PC's compiler:
+The rules' tests run on the PC, with the PC's compiler (C and C++, under the sanitizers):
 
     cmake -S tests -B build-tests && cmake --build build-tests && ctest --test-dir build-tests
+
+Configured with clang (`CC=clang CXX=clang++`), `tests/` builds the fuzzers too (libFuzzer):
+`irc_message_fuzz CORPUS-DIR`.
 
 ### Trying it on a board
 

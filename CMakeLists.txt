@@ -11,11 +11,12 @@ set(BMDS_SDK_VERSION "0.3.1" CACHE STRING "")
 set(BMDS_SDK_SHA256 "d96cffc9a2972fb14287821a6cd9a73362189753f3067e70fc3fd0a47b5d96c0" CACHE STRING "")
 include(cmake/sdk.cmake)
 
-project(bmds-apps C ASM)
+project(bmds-apps C CXX ASM)
 include(${BMDS_SDK_DIR}/cmake/BmdsProgram.cmake)
 
 # The apps: each folder makes its program(s) and its package.
 add_subdirectory(minesweeper)
+add_subdirectory(irc)
 
 # The repository: every package, its index and the public key, signed with BMDS_KEY. A GitHub
 # release of these files is the source users add:
