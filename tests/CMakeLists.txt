@@ -32,6 +32,23 @@ target_compile_options(irc_test PRIVATE -fno-exceptions -fno-rtti)
 target_link_libraries(irc_test PRIVATE irc_core)
 add_test(NAME irc COMMAND irc_test)
 
+# The VNC server's core (devplan/vnc.md §7), as the board builds it; zlib is the PC's here (the
+# board's is thirdparty/zlib, deflate only: the tests' viewer inflates).
+find_package(ZLIB REQUIRED)
+set(VNC_CORE ${CMAKE_CURRENT_LIST_DIR}/../vnc/core)
+set(VNC_CORE_SRCS ${VNC_CORE}/des.cpp ${VNC_CORE}/encode.cpp ${VNC_CORE}/keysym.cpp ${VNC_CORE}/pixelformat.cpp
+                  ${VNC_CORE}/rfb.cpp)
+add_library(vnc_core STATIC ${VNC_CORE_SRCS})
+target_include_directories(vnc_core PUBLIC ${VNC_CORE})
+target_compile_options(vnc_core PRIVATE -fno-exceptions -fno-rtti)
+target_link_libraries(vnc_core PUBLIC ZLIB::ZLIB)
+
+add_executable(vnc_test vnc/main.cpp vnc/rfb.cpp vnc/encode.cpp)
+target_include_directories(vnc_test PRIVATE ../thirdparty/doctest)
+target_compile_definitions(vnc_test PRIVATE DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS)
+target_link_libraries(vnc_test PRIVATE vnc_core)
+add_test(NAME vnc COMMAND vnc_test)
+
 # The fuzzers: every object instrumented, so the core's sources are built into each.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         add_executable(irc_message_fuzz irc/message_fuzz.cpp ${IRC_CORE_SRCS})

@@ -37,10 +37,14 @@ and an index signed by any other key is refused.
     minesweeper/            the game: field.c (rules), draw.c (pictures), main.c (the window),
                             app.desktop, icons/, DESCRIPTION, and its CMakeLists.txt
     irc/                    IRC, being built (devplan/irc.md): core/ is its portable C++ core
-    tests/                  the rules' tests, on the PC: Minesweeper's, IRC's core, the fuzzers
+    vnc/                    the VNC server, being built (devplan/vnc.md): core/ is its protocol and
+                            encodings in portable C++; it needs a BMDS with screen capture
+    tests/                  the rules' tests, on the PC: Minesweeper's, IRC's and VNC's cores, the fuzzers
     thirdparty/doctest/     the C++ tests' framework (MIT)
+    thirdparty/zlib/        zlib 1.3.1's deflate, for the VNC server (the zlib licence; VENDORED.md)
     devplan/                designs, as BMDS keeps them
     tools/icons.py          draws the game's icons
+    tools/vncview.py        a test viewer for the VNC server (Python, Pillow)
     tools/release           builds, signs and (with --publish) releases
     .github/workflows/      the release workflow: a tag in, a GitHub release out
 

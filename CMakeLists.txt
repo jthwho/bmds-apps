@@ -17,6 +17,7 @@ include(${BMDS_SDK_DIR}/cmake/BmdsProgram.cmake)
 # The apps: each folder makes its program(s) and its package.
 add_subdirectory(minesweeper)
 add_subdirectory(irc)
+add_subdirectory(vnc)
 
 # The repository: every package, its index and the public key, signed with BMDS_KEY. A GitHub
 # release of these files is the source users add:
