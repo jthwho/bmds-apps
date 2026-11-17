@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "buffers.h"
 #include "session.h"
 #include "text.h"
 
@@ -46,12 +47,22 @@ namespace test {
                         int64_t          number;
         };
 
+        /** @brief A buffer's line, copied out. */
+        struct ShownLine {
+                        uint32_t    buffer;
+                        std::string view, log;
+                        uint8_t     level;
+                        bool        notify;
+        };
+
         /** @brief A session and a scripted server: lines in, what it sent and told out. */
         struct Server {
                         irc::Session             session;
                         irc::Now                 now{1000, 1763289660000}; // 2025-11-16 10:41 UTC
                         std::vector<std::string> sent;                     // without CR LF
                         std::vector<Seen>        events;
+                        irc::Buffers            *buffers = nullptr; // when set, every event goes through it too
+                        std::vector<ShownLine>   lines;
 
                         explicit Server(irc::Config &&config) : session(std::move(config)) {}
 
@@ -65,9 +76,24 @@ namespace test {
                                         sent.push_back(l.substr(0, l.size() - 2));
                                 }
                                 irc::Event e;
-                                while (session.takeEvent(e))
+                                while (session.takeEvent(e)) {
                                         events.push_back(Seen{e.kind, e.flags, str(e.target), str(e.nick), str(e.text),
                                                               str(e.extra), e.time, e.number});
+                                        if (buffers != nullptr) {
+                                                irc::Vector<irc::Line> out;
+                                                REQUIRE(buffers->apply(e, session, out) == irc::Error::Ok);
+                                                keep(out);
+                                        }
+                                }
+                                return;
+                        }
+
+                        /** @brief Lines made outside the session (a command's), kept with the rest. */
+                        void keep(irc::Vector<irc::Line> &out) {
+                                for (const irc::Line &l : out)
+                                        lines.push_back(
+                                                ShownLine{l.buffer, str(l.view), str(l.log), l.level, l.notify});
+                                out.clear();
                                 return;
                         }
 
@@ -105,6 +131,13 @@ namespace test {
                         std::vector<std::string> take() {
                                 std::vector<std::string> out;
                                 out.swap(sent);
+                                return out;
+                        }
+
+                        /** @brief Takes the buffers' lines so far. */
+                        std::vector<ShownLine> takeLines() {
+                                std::vector<ShownLine> out;
+                                out.swap(lines);
                                 return out;
                         }
 

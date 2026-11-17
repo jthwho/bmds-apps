@@ -1,0 +1,259 @@
+/**
+ * @file      buffers.cpp
+ * @copyright Jason Howard. All rights reserved.
+ *
+ * SPDX-License-Identifier: MIT
+ * See LICENSE file in the project root folder for license information.
+ *
+ * One network's buffers (irc/core/buffers.h): events routed, lines made for the view and the
+ * log, counts and attention, private chats opened and renamed, passwords hidden; and the
+ * formatting they use (local times, nick colours, hiding).
+ */
+
+#include "buffers.h"
+#include "format.h"
+#include "helpers.h"
+
+using irc::Buffer;
+using irc::Error;
+using irc::Text;
+using test::Server;
+
+namespace {
+
+        // A session registered as jth, its events going through buffers.
+        struct World {
+                        irc::Buffers buffers;
+                        Server       s{test::config("jth")};
+                        World() {
+                                s.buffers = &buffers;
+                                s.registerAs("jth");
+                                s.takeLines();
+                        }
+                        Buffer *find(const char *name) { return buffers.find(name, irc::CaseMapping::Rfc1459); }
+        };
+
+        std::string colour(const char *nick) {
+                const uint8_t c = irc::Format::nickColour(nick, irc::CaseMapping::Rfc1459);
+                return std::string("\x03") + char('0' + c / 10) + char('0' + c % 10) + nick + "\x03";
+        }
+
+} // namespace
+
+TEST_CASE("Format: local times, nick colours, a password to NickServ hidden") {
+        using irc::Format::localTime;
+        irc::Format::LocalTime t = localTime(1763289660000, 0); // 2025-11-16 10:41:00 UTC
+        CHECK(t.year == 2025);
+        CHECK(t.month == 11);
+        CHECK(t.day == 16);
+        CHECK(t.hour == 10);
+        CHECK(t.minute == 41);
+        t = localTime(1763289660000, -480); // PST: the same day, 02:41
+        CHECK(t.hour == 2);
+        t = localTime(1763289660000 - 11 * 3600000LL, -480); // the day before
+        CHECK(t.day == 15);
+        CHECK(t.hour == 15);
+        t = localTime(0, -60); // before 1970
+        CHECK(t.year == 1969);
+        CHECK(t.hour == 23);
+
+        using irc::CaseMapping;
+        CHECK(irc::Format::nickColour("alice", CaseMapping::Rfc1459) ==
+              irc::Format::nickColour("ALICE", CaseMapping::Rfc1459));
+        CHECK(irc::Format::nickColour("a[b]", CaseMapping::Rfc1459) ==
+              irc::Format::nickColour("a{b}", CaseMapping::Rfc1459));
+        for (const char *n : {"a", "b", "jth", "someone", "x"}) {
+                const uint8_t c = irc::Format::nickColour(n, CaseMapping::Rfc1459);
+                CHECK(c >= 2);
+                CHECK(c <= 13);
+                CHECK(c != 8);  // yellow
+                CHECK(c != 0);  // white
+                CHECK(c != 11); // light cyan
+        }
+
+        const auto hidden = [](Text target, Text text) {
+                irc::String out;
+                return irc::Format::hideSecret(target, text, out) ? test::str(out) : std::string("(as it is)");
+        };
+        CHECK(hidden("NickServ", "IDENTIFY secret") == "IDENTIFY ****");
+        CHECK(hidden("nickserv", "identify jth secret") == "identify jth ****");
+        CHECK(hidden("NickServ", "REGISTER secret me@example.com") == "REGISTER **** me@example.com");
+        CHECK(hidden("NickServ", "GHOST jth secret") == "GHOST jth ****");
+        CHECK(hidden("NickServ", "SET PASSWORD newone") == "SET PASSWORD ****");
+        CHECK(hidden("NickServ", "INFO jth") == "(as it is)");
+        CHECK(hidden("NickServ", "IDENTIFY") == "(as it is)");
+        CHECK(hidden("alice", "IDENTIFY secret") == "(as it is)");
+}
+
+TEST_CASE("Buffers: a channel's messages, its view's and log's lines, counts and attention") {
+        World w;
+        w.s.say(":jth!u@h JOIN #bmds");
+        Buffer *bmds = w.find("#bmds");
+        REQUIRE(bmds != nullptr);
+        CHECK(bmds->type == Buffer::Type::Channel);
+        CHECK(bmds->joined);
+        auto lines = w.s.takeLines();
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].view == "10:41 -->\x0f\tYou joined #bmds");
+        CHECK(lines[0].level == 0);
+        CHECK(bmds->unread == 0); // not a message
+
+        w.s.say(":alice!a@h PRIVMSG #bmds :hello there");
+        lines = w.s.takeLines();
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].buffer == bmds->id);
+        CHECK(lines[0].view == "10:41 <" + colour("alice") + ">\x0f\thello there");
+        CHECK(lines[0].log == "10:41:00 <alice> hello there");
+        CHECK(lines[0].level == 1);
+        CHECK_FALSE(lines[0].notify);
+        CHECK(bmds->unread == 1);
+        CHECK(bmds->attention == 1);
+
+        // A mention: reversed, counted, an alert, told.
+        w.s.say(":bob!b@h PRIVMSG #bmds :jth: did the TLS land?");
+        lines = w.s.takeLines();
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].view == "10:41 \x16<" + colour("bob") + ">\x16\x0f\tjth: did the TLS land?");
+        CHECK(lines[0].level == 2);
+        CHECK(lines[0].notify);
+        CHECK(bmds->unread == 2);
+        CHECK(bmds->mentions == 1);
+        CHECK(bmds->attention == 2);
+        CHECK(bmds->speakers.size() == 2);
+        CHECK(bmds->speakers[0] == Text("bob")); // last first
+
+        // A highlight word too.
+        (void)w.buffers.settings().highlights.append([] {
+                irc::String s;
+                (void)s.assign("bmds");
+                return s;
+        }());
+        w.s.say(":carol!c@h PRIVMSG #bmds :BMDS rocks");
+        CHECK(w.s.takeLines()[0].level == 2);
+
+        // In view in a focused window: read, nothing counted or told; unfocused: counted again.
+        w.buffers.setActive(bmds->id, true);
+        CHECK(bmds->unread == 0);
+        CHECK(bmds->attention == 0);
+        w.s.say(":bob!b@h PRIVMSG #bmds :jth: again");
+        lines = w.s.takeLines();
+        CHECK_FALSE(lines[0].notify);
+        CHECK(bmds->unread == 0);
+        w.buffers.setActive(bmds->id, false);
+        w.s.say(":bob!b@h PRIVMSG #bmds :jth: and again");
+        CHECK(w.s.takeLines()[0].notify);
+        CHECK(bmds->mentions == 1);
+
+        // /me, our own message (shown, not counted), a notice to the channel.
+        w.s.say(":alice!a@h PRIVMSG #bmds :\x01"
+                "ACTION waves\x01");
+        CHECK(w.s.takeLines()[0].view == "10:41 *\x0f\t" + colour("alice") + " waves");
+        REQUIRE(w.s.session.privmsg("#bmds", "mine", w.s.now) == Error::Ok);
+        w.s.flush();
+        lines = w.s.takeLines();
+        CHECK(lines[0].view == "10:41 <\x02jth\x02>\x0f\tmine");
+        CHECK(lines[0].log == "10:41:00 <jth> mine");
+        CHECK(bmds->unread == 2); // alice's /me counted, ours not
+        w.s.say(":alice!a@h NOTICE #bmds :a notice");
+        CHECK(w.s.takeLines()[0].view == "10:41 -alice-\x0f\ta notice");
+}
+
+TEST_CASE("Buffers: private chats opened, alerts, renamed with the nick; notices routed") {
+        World w;
+        w.s.say(":jth!u@h JOIN #bmds");
+        w.s.takeLines();
+        w.s.say(":alice!a@h PRIVMSG jth :psst");
+        Buffer *alice = w.find("alice");
+        REQUIRE(alice != nullptr);
+        CHECK(alice->type == Buffer::Type::Query);
+        auto lines = w.s.takeLines();
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].buffer == alice->id);
+        CHECK(lines[0].level == 2); // every private message an alert
+        CHECK(lines[0].notify);
+        const uint32_t id = alice->id;
+
+        // Their nick change: the chat follows them.
+        w.s.say(":alice!a@h NICK :alicia");
+        CHECK(w.find("alice") == nullptr);
+        REQUIRE(w.find("alicia") != nullptr);
+        CHECK(w.find("alicia")->id == id);
+        lines = w.s.takeLines();
+        bool renamed = false;
+        for (const auto &l : lines)
+                if (l.buffer == id && l.view.find("is now known as") != std::string::npos) renamed = true;
+        CHECK(renamed);
+        // Their quit, shown in the chat.
+        w.s.say(":alicia!a@h QUIT :bye");
+        lines = w.s.takeLines();
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].buffer == id);
+        CHECK(lines[0].view.find("quit (bye)") != std::string::npos);
+
+        // Notices: a service's to the network's buffer, a person's to the one in view.
+        w.s.say(":NickServ!N@services. NOTICE jth :You are now identified");
+        lines = w.s.takeLines();
+        CHECK(lines[0].buffer == w.buffers.network().id);
+        CHECK(lines[0].level == 1);
+        w.buffers.setActive(w.find("#bmds")->id, true);
+        w.s.say(":bob!b@h NOTICE jth :psst, a notice");
+        lines = w.s.takeLines();
+        CHECK(lines[0].buffer == w.find("#bmds")->id);
+        CHECK(lines[0].level == 2);
+        w.buffers.setActive(0, true); // another network's in view
+        w.s.say(":bob!b@h NOTICE jth :another");
+        CHECK(w.s.takeLines()[0].buffer == w.buffers.network().id);
+}
+
+TEST_CASE("Buffers: joins shown or not, parts and kicks, the topic, server lines, a password hidden") {
+        World w;
+        w.s.say(":jth!u@h JOIN #bmds");
+        w.s.say(":dave!d@h JOIN #bmds dave_acct :Dave");
+        auto lines = w.s.takeLines();
+        REQUIRE(lines.size() == 2);
+        CHECK(lines[1].view == "10:41 -->\x0f\t" + colour("dave") + " (dave_acct) joined");
+        CHECK(lines[1].log == "10:41:00 --> dave (dave_acct) joined");
+        w.buffers.settings().showJoins = false;
+        w.s.say(":erin!e@h JOIN #bmds");
+        w.s.say(":erin!e@h PART #bmds :later");
+        CHECK(w.s.takeLines().empty());
+        w.buffers.settings().showJoins = true;
+        w.s.say(":dave!d@h PART #bmds :later");
+        CHECK(w.s.takeLines()[0].view == "10:41 <--\x0f\t" + colour("dave") + " left (later)");
+
+        w.s.say(":srv 332 jth #bmds :BMDS on the P4");
+        CHECK(w.s.takeLines()[0].view == "10:41 --\x0f\tTopic: BMDS on the P4");
+        w.s.say(":srv 372 jth :- the message of the day");
+        lines = w.s.takeLines();
+        CHECK(lines[0].buffer == w.buffers.network().id);
+        CHECK(lines[0].view == "10:41 --\x0f\t- the message of the day");
+
+        // Our message to NickServ: its password hidden in both lines.
+        REQUIRE(w.s.session.privmsg("NickServ", "IDENTIFY jth secret", w.s.now) == Error::Ok);
+        w.s.flush();
+        lines = w.s.takeLines();
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].view.find("secret") == std::string::npos);
+        CHECK(lines[0].log == "10:41:00 <jth> IDENTIFY jth ****");
+
+        // Kicked: the channel's buffer stays, not joined.
+        w.s.say(":carol!c@h KICK #bmds jth :out");
+        lines = w.s.takeLines();
+        REQUIRE(w.find("#bmds") != nullptr);
+        CHECK_FALSE(w.find("#bmds")->joined);
+        CHECK(lines[0].view == "10:41 <--\x0f\t\x02jth\x02 was kicked by carol (out)");
+
+        // The zone the times are shown in; a line of the client's own.
+        w.buffers.settings().utcOffsetMinutes = -480;
+        irc::Vector<irc::Line> out;
+        REQUIRE(w.buffers.note(w.find("#bmds")->id, "a note", w.s.now.wall, out) == Error::Ok);
+        REQUIRE(out.size() == 1);
+        CHECK(test::str(out[0].view) == "02:41 --\x0f\ta note");
+        // Closing; the network's buffer can't be.
+        const uint32_t id = w.find("#bmds")->id;
+        w.buffers.close(id);
+        CHECK(w.buffers.byId(id) == nullptr);
+        w.buffers.close(w.buffers.network().id);
+        CHECK(w.buffers.count() >= 1);
+        CHECK(w.buffers.at(0).type == Buffer::Type::Network);
+}

@@ -73,6 +73,29 @@ namespace irc {
                 /** @brief Writes @p bytes as base64 (SASL's) into @p out. @return `Ok` or `NoMem`. */
                 Error base64(Text bytes, String &out);
 
+                /** @brief A moment as a calendar shows it. */
+                struct LocalTime {
+                                int year = 1970, month = 1, day = 1, hour = 0, minute = 0, second = 0;
+                };
+
+                /** @brief Returns @p utcMs (ms since 1970) in a zone @p offsetMinutes from UTC. */
+                LocalTime localTime(int64_t utcMs, int32_t offsetMinutes);
+
+                /**
+                 * @brief Returns the mIRC colour (0-98) @p nick is drawn in: the same for the same
+                 *        nick (any case under @p mapping), one of those readable on a light face.
+                 */
+                uint8_t nickColour(Text nick, CaseMapping mapping);
+
+                /**
+                 * @brief Writes @p text with a password hidden into @p out if it is one to a
+                 *        service (devplan/irc.md §7a): to NickServ, `IDENTIFY [account] ****`,
+                 *        `REGISTER **** email`, `GHOST|REGAIN|RECOVER nick ****`, `SET PASSWORD
+                 *        ****`; to anyone else, or another command, as it is.
+                 * @return True if something was hidden.
+                 */
+                bool hideSecret(Text target, Text text, String &out);
+
         } // namespace Format
 
 } // namespace irc

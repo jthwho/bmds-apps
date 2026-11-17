@@ -6,8 +6,8 @@ release, which brings what it needs: TLS sockets (`tls_ctl`, network.md §35) an
 (BMDS's `devplan/chatview.md`). **Approved as proposed** 2026-11-16 (§11).
 
 Status: **step 0 built in BMDS** (`ChatView`: its chatview.md §7-§9; the tabs' additions: its
-tabs.md §7-§9); **step 1 built** (§12); **step 2's first part built** (§13: containers,
-ISUPPORT, formatting, the session); its second part (buffers, commands, completion) next.
+tabs.md §7-§9); **steps 1 and 2 built** (§12; §13: containers, ISUPPORT, formatting, the
+session; §14: buffers, commands, completion); step 3, the app, next.
 Paths below are this repository's unless they name BMDS.
 
 ## 1. Goal
@@ -71,8 +71,9 @@ irc/core/              portable C++ (C++20, no exceptions or RTTI; no libstdc++ 
   session.*            one network's protocol: registration, CAP, SASL, PING, nick fallback,
                        ISUPPORT (CASEMAPPING, PREFIX, CHANTYPES, NETWORK), channels and their
                        members, queries, modes, away; events out, lines to send out. No sockets.
-  buffers.*            each channel's and query's lines (capped, PSRAM), unread and mention
-                       counts, the marker; a log line for each
+  buffers.*            each channel's and query's state: unread and mention counts, attention,
+                       who spoke last; events made into its view's line and its log's (the
+                       lines themselves kept by its ChatView and the log, §14)
   commands.*           what is typed: /join /part /msg /me /query /nick /topic /away /whois
                        /mode /kick /quit /raw /clear /close; the rest sent as it is
   complete.*           Tab: nicks (recent speakers first), channels, commands
@@ -357,3 +358,42 @@ The core's containers, ISUPPORT, formatting and one network's session (§3, §7)
   reconnect delays. `irc_session_fuzz` (the server's lines, the user's, time and reconnects
   from the input): 3 minutes on three workers, about 2.4 million runs each, 1413 edges; every
   line sent one line within 512 bytes, every event's text UTF-8; nothing found.
+
+## 14. Step 2, second part, built (2026-11-17)
+
+Buffers, commands and Tab completion: the core is whole (60 KB for the board at `-O2`).
+
+- **Changed from §3: buffers keep no lines.** Each conversation has a `ChatView` page of its
+  own (§6), and `ChatView` keeps its lines (`maxLines`); the logs are on the card. A copy in the
+  core would only cost PSRAM. A `Buffer` is what describes a conversation: its kind and name,
+  unread and mention counts, its attention (a tab's, BMDS's tabs.md), whether its channel is
+  joined, who spoke last (32, for Tab).
+- **`Buffers`** (one a network): the session's events routed (§7b) and made into `Line`s, each
+  with its view's text (`HH:MM marker`, a tab, the text, mIRC's codes kept; nicks in a colour of
+  their own, ours bold, a mention's marker reversed) and its log's (`HH:MM:SS marker text`,
+  plain), in the zone the settings give.
+  - A channel's or private chat's messages to it, a private chat opened by a message; a
+    service's or the server's notice to the network's buffer, a person's to the buffer in view
+    (when it is this network's).
+  - Counts and attention for what isn't in view in a focused window: a message is activity; a
+    mention (our nick or a highlight word, as a word of its own) or anything private an alert,
+    and `notify` set on its line. `setActive()` marks a buffer read.
+  - A private chat follows the person to their new nick; their quit is shown in it.
+  - Joins, parts and quits shown or not (`showJoins`); kicked or parted, a channel's buffer
+    stays, not joined; `disconnected()` marks every channel left.
+  - A password typed to NickServ hidden in the view and the log (`Format::hideSecret`:
+    `IDENTIFY [account] ****`, `REGISTER **** email`, `GHOST nick ****`, `SET PASSWORD ****`).
+- **`runCommand()`:** text to the channel or person in view (`//` for text starting with `/`);
+  `/me /msg /notice /query /ns /cs /join` (`#` added, `#a,#b` with keys) `/part /close /nick
+  /topic` (none: shown) `/away /back /whois /names /mode` (`+o nick`: the channel in view's)
+  `/kick /invite /quit /raw /quote /clear /help`; any other sent as `CMD args`. A mistake is a
+  line in the buffer (`Usage: ...`, a line break refused), not an error. `Outcome` tells the
+  window what else to do: show a private chat, clear, close, the network quit.
+- **`Completer`:** Tab on the word before the cursor, again for the next match: commands at the
+  line's start, channels, nicks (in a channel those who spoke last first, if still there, then
+  the rest by name; never ours); `: ` after a nick starting the line.
+- **Fixed on the way:** `PART` without a reason was sent as `PART :#chan`.
+- **Tested:** 50 cases, 1327 checks (buffers' routing, lines, counts and hiding; every command
+  and its mistakes; Tab's orders and cycling). `irc_session_fuzz` now types commands in its
+  buffers, presses Tab and passes every event through the buffers: 3 minutes on three workers,
+  about 1.9 million runs each, 1757 edges, nothing found.

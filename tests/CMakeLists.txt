@@ -21,12 +21,14 @@ add_test(NAME field COMMAND field_test)
 # IRC's core as the board builds it: no exceptions or RTTI, and only C's headers and the
 # freestanding C++ ones (the board has no libstdc++).
 set(IRC_CORE ${CMAKE_CURRENT_LIST_DIR}/../irc/core)
-set(IRC_CORE_SRCS ${IRC_CORE}/message.cpp ${IRC_CORE}/str.cpp ${IRC_CORE}/isupport.cpp ${IRC_CORE}/format.cpp ${IRC_CORE}/session.cpp)
+set(IRC_CORE_SRCS ${IRC_CORE}/message.cpp ${IRC_CORE}/str.cpp ${IRC_CORE}/isupport.cpp ${IRC_CORE}/format.cpp ${IRC_CORE}/session.cpp
+                  ${IRC_CORE}/buffers.cpp ${IRC_CORE}/commands.cpp ${IRC_CORE}/complete.cpp)
 add_library(irc_core STATIC ${IRC_CORE_SRCS})
 target_include_directories(irc_core PUBLIC ${IRC_CORE})
 target_compile_options(irc_core PRIVATE -fno-exceptions -fno-rtti)
 
-add_executable(irc_test irc/main.cpp irc/message.cpp irc/str.cpp irc/format.cpp irc/session.cpp)
+add_executable(irc_test irc/main.cpp irc/message.cpp irc/str.cpp irc/format.cpp irc/session.cpp irc/buffers.cpp
+                        irc/commands.cpp)
 target_include_directories(irc_test PRIVATE ../thirdparty/doctest)
 target_compile_definitions(irc_test PRIVATE DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS)
 target_compile_options(irc_test PRIVATE -fno-exceptions -fno-rtti)

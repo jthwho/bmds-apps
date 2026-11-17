@@ -889,7 +889,7 @@ namespace irc {
         Error Session::part(Text channel, Text reason) {
                 if (!isName(channel) || hasBreak(reason)) return Error::Malformed;
                 const Text p[] = {channel, reason};
-                send(Kind::User, "PART", p, reason.isEmpty() ? 1 : 2, true);
+                send(Kind::User, "PART", p, reason.isEmpty() ? 1 : 2, !reason.isEmpty());
                 return Error::Ok;
         }
 

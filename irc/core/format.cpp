@@ -217,6 +217,78 @@ namespace irc {
                         return Error::Ok;
                 }
 
+
+                LocalTime localTime(int64_t utcMs, int32_t offsetMinutes) {
+                        // Floor division: times before 1970 too.
+                        const int64_t ms = utcMs + int64_t(offsetMinutes) * 60000;
+                        int64_t       days = ms / 86400000;
+                        int64_t       rest = ms % 86400000;
+                        if (rest < 0) {
+                                rest += 86400000;
+                                --days;
+                        }
+                        // Howard Hinnant's civil_from_days.
+                        const int64_t  z = days + 719468;
+                        const int64_t  era = (z >= 0 ? z : z - 146096) / 146097;
+                        const unsigned doe = unsigned(z - era * 146097);
+                        const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                        const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                        const unsigned mp = (5 * doy + 2) / 153;
+                        LocalTime      t;
+                        t.day = int(doy - (153 * mp + 2) / 5 + 1);
+                        t.month = int(mp < 10 ? mp + 3 : mp - 9);
+                        t.year = int(int64_t(yoe) + era * 400 + (t.month <= 2));
+                        t.hour = int(rest / 3600000);
+                        t.minute = int(rest / 60000 % 60);
+                        t.second = int(rest / 1000 % 60);
+                        return t;
+                }
+
+                uint8_t nickColour(Text nick, CaseMapping mapping) {
+                        // mIRC's dark ones: navy, green, red, brown, purple, orange, teal, blue, pink.
+                        static const uint8_t colours[] = {2, 3, 4, 5, 6, 7, 10, 12, 13};
+                        uint32_t             h = 2166136261u; // FNV-1a over the folded nick
+                        for (char c : nick) {
+                                h ^= uint8_t(foldCase(c, mapping));
+                                h *= 16777619u;
+                        }
+                        return colours[h % sizeof(colours)];
+                }
+
+                bool hideSecret(Text target, Text text, String &out) {
+                        out.clear();
+                        if (!target.equalsIgnoringCase("NickServ")) return false;
+                        // The words, the separators kept as they were.
+                        size_t starts[8], ends[8], n = 0, at = 0;
+                        while (at < text.size() && n < 8) {
+                                while (at < text.size() && text[at] == ' ') ++at;
+                                if (at == text.size()) break;
+                                starts[n] = at;
+                                while (at < text.size() && text[at] != ' ') ++at;
+                                ends[n++] = at;
+                        }
+                        if (n < 2) return false;
+                        const Text command = text.mid(starts[0], ends[0] - starts[0]);
+                        size_t     hidden = n; // the word hidden (n: none)
+                        if (command.equalsIgnoringCase("IDENTIFY")) {
+                                hidden = n == 2 ? 1 : 2;
+                        } else if (command.equalsIgnoringCase("REGISTER")) {
+                                hidden = 1;
+                        } else if (command.equalsIgnoringCase("GHOST") || command.equalsIgnoringCase("REGAIN") ||
+                                   command.equalsIgnoringCase("RECOVER")) {
+                                hidden = n >= 3 ? 2 : n;
+                        } else if (command.equalsIgnoringCase("SET") && n >= 3 &&
+                                   text.mid(starts[1], ends[1] - starts[1]).equalsIgnoringCase("PASSWORD")) {
+                                hidden = 2;
+                        }
+                        if (hidden >= n) return false;
+                        // The word replaced, the rest as it was.
+                        if (out.append(text.left(starts[hidden])) != Error::Ok || out.append("****") != Error::Ok ||
+                            out.append(text.mid(ends[hidden])) != Error::Ok)
+                                return false;
+                        return true;
+                }
+
         } // namespace Format
 
 } // namespace irc
