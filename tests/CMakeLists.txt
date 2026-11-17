@@ -33,10 +33,10 @@ target_link_libraries(irc_test PRIVATE irc_core)
 add_test(NAME irc COMMAND irc_test)
 
 # The VNC server's core (devplan/vnc.md §7), as the board builds it; zlib is the PC's here (the
-# board's is thirdparty/zlib, deflate only: the tests' viewer inflates).
+# board's is thirdparty/zlib).
 find_package(ZLIB REQUIRED)
 set(VNC_CORE ${CMAKE_CURRENT_LIST_DIR}/../vnc/core)
-set(VNC_CORE_SRCS ${VNC_CORE}/des.cpp ${VNC_CORE}/encode.cpp ${VNC_CORE}/keysym.cpp ${VNC_CORE}/pixelformat.cpp
+set(VNC_CORE_SRCS ${VNC_CORE}/clipboard.cpp ${VNC_CORE}/des.cpp ${VNC_CORE}/encode.cpp ${VNC_CORE}/keysym.cpp ${VNC_CORE}/pixelformat.cpp
                   ${VNC_CORE}/rfb.cpp ${VNC_CORE}/text.cpp)
 add_library(vnc_core STATIC ${VNC_CORE_SRCS})
 target_include_directories(vnc_core PUBLIC ${VNC_CORE})

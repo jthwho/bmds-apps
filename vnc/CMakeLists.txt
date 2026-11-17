@@ -1,7 +1,7 @@
-# The VNC server (devplan/vnc.md): the core (portable C++, tested on the PC: tests/vnc), zlib's
-# deflate (thirdparty/zlib), and the program, its app and its package. It needs a BMDS with screen
-# capture (gui_screen_capture, slot 136): until that release it stays out of the repository's
-# package list.
+# The VNC server (devplan/vnc.md): the core (portable C++, tested on the PC: tests/vnc), zlib
+# (thirdparty/zlib: deflate, and inflate for the Extended Clipboard), and the program, its app and
+# its package. It needs a BMDS with screen capture (gui_screen_capture, slot 136): until that
+# release it stays out of the repository's package list.
 
 set(VNCSERVER_VERSION 0.1.0)
 
@@ -9,13 +9,16 @@ add_library(vnc_zlib STATIC
         ${CMAKE_CURRENT_LIST_DIR}/../thirdparty/zlib/adler32.c
         ${CMAKE_CURRENT_LIST_DIR}/../thirdparty/zlib/crc32.c
         ${CMAKE_CURRENT_LIST_DIR}/../thirdparty/zlib/deflate.c
+        ${CMAKE_CURRENT_LIST_DIR}/../thirdparty/zlib/inffast.c
+        ${CMAKE_CURRENT_LIST_DIR}/../thirdparty/zlib/inflate.c
+        ${CMAKE_CURRENT_LIST_DIR}/../thirdparty/zlib/inftrees.c
         ${CMAKE_CURRENT_LIST_DIR}/../thirdparty/zlib/trees.c
         ${CMAKE_CURRENT_LIST_DIR}/../thirdparty/zlib/zutil.c)
 target_include_directories(vnc_zlib PUBLIC ${CMAKE_CURRENT_LIST_DIR}/../thirdparty/zlib)
 target_link_libraries(vnc_zlib PUBLIC bmds_headers)
 target_compile_options(vnc_zlib PRIVATE -O2)
 
-add_library(vnc_core STATIC core/des.cpp core/encode.cpp core/keysym.cpp core/pixelformat.cpp core/rfb.cpp
+add_library(vnc_core STATIC core/clipboard.cpp core/des.cpp core/encode.cpp core/keysym.cpp core/pixelformat.cpp core/rfb.cpp
             core/text.cpp)
 target_include_directories(vnc_core PUBLIC core)
 target_link_libraries(vnc_core PUBLIC bmds_headers vnc_zlib)

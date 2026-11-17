@@ -12,6 +12,7 @@
 
 #include "server.h"
 
+#include "core/clipboard.h"
 #include "core/text.h"
 
 #include <bmds/guiclasses.h>
@@ -101,7 +102,16 @@ namespace vnc {
                         bool     full = false;      // the whole screen asked for
                         bool     changed = false;   // the screen changed since its last capture
                         bool     more = false;      // its last capture left changes behind
-                        bool     cutPending = false; // the board's copy to send it
+                        bool     cutPending = false; // the board's copy to send it (or say there is one)
+                        // The Extended Clipboard (devplan/vnc.md §23): asked for in its SetEncodings,
+                        // its caps (the spec's defaults until it sends its own), messages to send it.
+                        bool     extended = false;
+                        uint32_t clipFlags = ExtendedClipboard::DefaultFlags;
+                        uint32_t clipTextMax = ExtendedClipboard::DefaultTextMax;
+                        bool     capsPending = false;    // our caps (each SetEncodings asking for it)
+                        bool     requestPending = false; // ask for its copy (it said it has one)
+                        bool     providePending = false; // it asked for the board's copy
+                        bool     notifyPending = false;  // it peeked: say what the board has
                         unsigned refused = 0;        // injections the system refused (the first few logged)
                         // The viewer's SetPixelFormat and SetEncodings while the worker encodes: kept,
                         // and given to the encoder before the next job.
@@ -252,6 +262,17 @@ namespace vnc {
                 }
                 _pixels = static_cast<uint8_t *>(pixels);
                 _clipboard = bmds_clipboard_new(_gui, 0); // 0: no clipboard sharing, the rest works
+                // Every name an event is compared with, known now: a name looked up later is a call on
+                // the connection, and an event's strings last only until the next one (gui.h): the
+                // first board copy came through with bytes overwritten, or not at all.
+                const char *names[] = {BMDS_GUI_CLIPBOARD_CHANGED,
+                                       BMDS_GUI_CLIPBOARD_PASTED,
+                                       BMDS_GUI_SCREEN_SHARE_CHANGED,
+                                       BMDS_GUI_NOTIFICATION_ACTIVATED,
+                                       "clipboard",
+                                       "primary"};
+                uint32_t    atoms[sizeof(names) / sizeof(names[0])] = {};
+                (void)bmds_gui_atoms(_gui, names, sizeof(names) / sizeof(names[0]), atoms);
                 _cut = static_cast<char *>(malloc(Session::MaxCutText));
                 // The cores' load counters (place()), and the worker on the less busy core now.
                 bmds_counter_t info;
@@ -313,7 +334,7 @@ namespace vnc {
                         guiEvents();
                         if (_viewerCount > 0) place();
                         for (size_t i = 0; i < _viewerCount; ++i) startTls(_viewers[i]);
-                        for (size_t i = 0; i < _viewerCount; ++i) flushCut(_viewers[i]);
+                        for (size_t i = 0; i < _viewerCount; ++i) flushClipboard(_viewers[i]);
                         startUpdate();
                         (void)bmds_gui_flush(_gui);
                         // The GUI, the listener, the worker's answers, display/output's watch, the viewers.
@@ -367,6 +388,8 @@ namespace vnc {
                 int              r;
                 while ((r = bmds_gui_next_event(_gui, &e, 0)) == 1) {
                         if (_settings.verbose) {
+                                // A name not known yet is looked up: this event's own strings are
+                                // gone then, but the ones read below are all known (start()).
                                 const char *name = bmds_gui_atom_name(_gui, e.name);
                                 fprintf(stderr, "event %s from %u\n", name != nullptr ? name : "?", unsigned(e.source));
                         }
@@ -422,29 +445,76 @@ namespace vnc {
                         if (bmds_clipboard_owns(_gui, _clipboard, "clipboard", &owns) == 0 && owns.number != 0) return;
                         (void)bmds_clipboard_paste(_gui, _clipboard, "clipboard", "text/plain;charset=utf-8");
                 } else if (bmds_gui_event_is(_gui, &e, BMDS_GUI_CLIPBOARD_PASTED) && e.count == 3 && _cut != nullptr) {
+                        // Kept as UTF-8 (cut at a character's start if too long): each viewer's form
+                        // made as it is sent.
                         const bmds_gui_value_t &bytes = e.values[2];
-                        _cutSize = vnc::Text::latin1FromUtf8(bytes.text, bytes.length, _cut, Session::MaxCutText);
+                        size_t n = bytes.length < Session::MaxCutText ? bytes.length : Session::MaxCutText;
+                        if (n < bytes.length)
+                                while (n > 0 && (uint8_t(bytes.text[n]) & 0xc0) == 0x80) --n;
+                        memcpy(_cut, bytes.text, n);
+                        _cutSize = n;
                         if (_settings.verbose)
                                 fprintf(stderr, "clipboard: %u bytes to the viewers\n", unsigned(_cutSize));
                         // To every viewer (output, as the screen is), each between its updates.
                         for (size_t i = 0; i < _viewerCount; ++i) {
                                 _viewers[i]->cutPending = _cutSize > 0;
-                                flushCut(_viewers[i]);
+                                flushClipboard(_viewers[i]);
                         }
                 }
                 return;
         }
 
-        void Server::flushCut(Viewer *v) {
-                if (!v->cutPending || (_busy && v == _jobViewer) || v->session.state() != Session::State::Normal)
-                        return;
-                if (OutBytes - v->outSize < _cutSize + 8) return; // after what is being sent
-                Writer w = v->appender();
-                Session::writeCutText(w, _cut, _cutSize);
-                v->outSize += w.size();
-                v->cutPending = false;
-                (void)writeViewer(v);
+        // What waits for a viewer, written after what is being sent (never into a job's update): our
+        // caps, a request for its copy, what the board has, the board's copy (as it takes it), a
+        // provide it asked for. One that doesn't fit waits for the buffer to empty; one too big even
+        // then is given up.
+        void Server::flushClipboard(Viewer *v) {
+                if ((_busy && v == _jobViewer) || v->session.state() != Session::State::Normal) return;
+                struct Item {
+                                bool *pending;
+                                Clip  what;
+                };
+                const Item   items[] = {{&v->capsPending, Clip::Caps},
+                                        {&v->requestPending, Clip::Request},
+                                        {&v->notifyPending, Clip::Notify},
+                                        {&v->cutPending, Clip::Copy},
+                                        {&v->providePending, Clip::Provide}};
+                const size_t before = v->outSize;
+                for (const Item &item : items) {
+                        if (!*item.pending) continue;
+                        Writer w = v->appender();
+                        if (!writeClipboard(v, item.what, w)) {
+                                if (v->outSize > 0) break; // room once what is there is sent
+                        } else {
+                                v->outSize += w.size();
+                        }
+                        *item.pending = false;
+                }
+                if (v->outSize > before) (void)writeViewer(v);
                 return;
+        }
+
+        bool Server::writeClipboard(const Viewer *v, Clip what, Writer &w) {
+                namespace X = ExtendedClipboard;
+                const bool canProvide = (v->clipFlags & X::Provide) != 0 && (v->clipFlags & X::Text) != 0;
+                switch (what) {
+                        case Clip::Caps:
+                                X::writeCaps(w, X::Request | X::Peek | X::Notify | X::Provide, 0); // 0: notify first
+                                break;
+                        case Clip::Request: X::writeFlags(w, X::Request | X::Text); break;
+                        case Clip::Notify: X::writeFlags(w, X::Notify | (_cutSize > 0 ? X::Text : 0)); break;
+                        case Clip::Copy:
+                                // Said, if it takes notifies; given, if it takes it unasked; else Latin-1.
+                                if (v->extended && (v->clipFlags & X::Notify) != 0) {
+                                        X::writeFlags(w, X::Notify | X::Text);
+                                        break;
+                                }
+                                if (v->extended && canProvide && _cutSize + 1 <= v->clipTextMax)
+                                        return X::writeText(w, _cut, _cutSize);
+                                return Session::writeCutTextFromUtf8(w, _cut, _cutSize);
+                        case Clip::Provide: return canProvide && X::writeText(w, _cut, _cutSize);
+                }
+                return !w.overflowed();
         }
 
         // ---- Viewers (devplan/vnc.md §21: several, one with the input)
@@ -983,6 +1053,12 @@ namespace vnc {
                 v->encodingCount = count < 64 ? count : 64;
                 for (size_t i = 0; i < v->encodingCount; ++i) v->encodings[i] = encodings[i];
                 v->pendingEncodings = true;
+                // The Extended Clipboard: our caps after each SetEncodings asking for it (the spec).
+                for (size_t i = 0; i < count; ++i)
+                        if (encodings[i] == Encoding::ExtendedClipboard) {
+                                v->extended = true;
+                                v->capsPending = true;
+                        }
                 return;
         }
 
@@ -1032,9 +1108,47 @@ namespace vnc {
                 if (utf8 == nullptr) return;
                 const size_t n = vnc::Text::utf8FromLatin1(text, length, utf8, length * 2);
                 utf8[n] = '\0';
-                (void)bmds_clipboard_copy_text(_server._gui, _server._clipboard, "clipboard", utf8);
-                if (_server._settings.verbose) fprintf(stderr, "clipboard: %u bytes from the viewer\n", unsigned(n));
+                _server.pasteFromViewer(_viewer, utf8);
                 free(utf8);
+                return;
+        }
+
+        // The Extended Clipboard (devplan/vnc.md §23): its caps kept; a copy it says it has asked
+        // for (from the viewer with the input), its text when it comes; the board's when it asks.
+        void Server::Events::extendedClipboard(uint32_t flags, const uint8_t *data, size_t length) {
+                namespace X = ExtendedClipboard;
+                Viewer *v = _viewer;
+                if ((flags & X::Caps) != 0) {
+                        v->clipFlags = flags;
+                        v->clipTextMax = X::capsTextMax(flags, data, length);
+                } else if ((flags & X::Request) != 0) {
+                        if ((flags & X::Text) != 0 && _server._cutSize > 0) v->providePending = true;
+                } else if ((flags & X::Peek) != 0) {
+                        v->notifyPending = true;
+                } else if ((flags & X::Notify) != 0) {
+                        if ((flags & X::Text) != 0 && v == _server._input) v->requestPending = true;
+                } else if ((flags & X::Provide) != 0) {
+                        if (v != _server._input || _server._clipboard == 0) return;
+                        char *text = static_cast<char *>(malloc(Session::MaxCutText + 1));
+                        if (text == nullptr) return;
+                        const long n = X::readText(flags, data, length, text, Session::MaxCutText);
+                        if (n >= 0) {
+                                text[n] = '\0';
+                                _server.pasteFromViewer(v, text);
+                        } else {
+                                _server.event("%s: its copy not taken (past %u KB, or unreadable)", v->name,
+                                              unsigned(Session::MaxCutText / 1024));
+                        }
+                        free(text);
+                }
+                return; // what it asked for is sent by the loop (flushClipboard())
+        }
+
+        // A viewer's copy onto the board's clipboard selection (our copy: its changed isn't sent back).
+        void Server::pasteFromViewer(Viewer *v, const char *utf8) {
+                (void)bmds_clipboard_copy_text(_gui, _clipboard, "clipboard", utf8);
+                if (_settings.verbose)
+                        fprintf(stderr, "clipboard: %u bytes from %s\n", unsigned(strlen(utf8)), v->name);
                 return;
         }
 

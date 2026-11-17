@@ -6,9 +6,10 @@
  * See LICENSE file in the project root folder for license information.
  *
  * The VNC server's protocol (vnc/core): DES and VNC's challenge, the handshake in each version,
- * the viewer's messages, pixel formats and keysyms.
+ * the viewer's messages, pixel formats, keysyms and the clipboard.
  */
 
+#include "clipboard.h"
 #include "des.h"
 #include "keysym.h"
 #include "rfb.h"
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <zlib.h>
 
 using vnc::Session;
 using vnc::Writer;
@@ -57,6 +59,12 @@ namespace {
                                 pointers.insert(pointers.end(), {b, x, y});
                         }
                         void cutText(const char *t, size_t n) override { cut.assign(t, n); }
+                        void extendedClipboard(uint32_t flags, const uint8_t *data, size_t n) override {
+                                clipFlags.push_back(flags);
+                                clipData.assign(data, data + n);
+                        }
+                        std::vector<uint32_t> clipFlags; // each Extended Clipboard message's
+                        std::vector<uint8_t>  clipData;  // the last one's bytes after its flags
         };
 
         void fixedChallenge(void *, uint8_t *out, size_t n) {
@@ -385,4 +393,119 @@ TEST_CASE("Cut text: Latin-1 and UTF-8 both ways") {
         CHECK(std::string(out, n) == "caf\xe9 ? ? ?");
         // Overlong forms aren't Latin-1's characters.
         CHECK(std::string(out, latin1FromUtf8("\xc1\x81", 2, out, sizeof(out))) == "?");
+}
+
+namespace {
+
+        namespace X = vnc::ExtendedClipboard;
+
+        // What a viewer's zlib makes of @p data: a stream flushed, not ended (TigerVNC's way).
+        std::vector<uint8_t> deflateSynced(const std::string &data) {
+                z_stream z = {};
+                REQUIRE(deflateInit(&z, 6) == Z_OK);
+                std::vector<uint8_t> out(data.size() + 64);
+                z.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(data.data()));
+                z.avail_in = uInt(data.size());
+                z.next_out = out.data();
+                z.avail_out = uInt(out.size());
+                REQUIRE(deflate(&z, Z_SYNC_FLUSH) == Z_OK);
+                out.resize(out.size() - z.avail_out);
+                deflateEnd(&z);
+                return out;
+        }
+
+        std::string sized(const std::string &text) {
+                const uint32_t n = uint32_t(text.size());
+                return std::string{char(n >> 24), char(n >> 16), char(n >> 8), char(n)} + text;
+        }
+
+} // namespace
+
+TEST_CASE("Extended Clipboard: caps, flags, and text each way (CR LF, a NUL, zlib)") {
+        std::vector<uint8_t> buffer(4096);
+        Writer               w(buffer.data(), buffer.size());
+        X::writeCaps(w, X::Request | X::Notify | X::Provide, 0);
+        CHECK(std::vector<uint8_t>(buffer.data(), buffer.data() + w.size()) == hex("03000000fffffff81b00000100000000"));
+        w.clear();
+        X::writeFlags(w, X::Notify | X::Text);
+        CHECK(std::vector<uint8_t>(buffer.data(), buffer.data() + w.size()) == hex("03000000fffffffc08000001"));
+        const uint8_t sizes[] = {0, 0x10, 0, 0, 0, 0, 0, 0};
+        CHECK(X::capsTextMax(X::Caps | X::Text | X::Html, sizes, sizeof(sizes)) == 0x100000);
+        CHECK(X::capsTextMax(X::Caps | X::Html, sizes, sizeof(sizes)) == 0);
+
+        // The board's copy out: LF as CR LF (a CR LF kept), a NUL after it, its own zlib stream.
+        w.clear();
+        const std::string board = "one\ntwo\r\ncaf\xc3\xa9\n";
+        REQUIRE(X::writeText(w, board.data(), board.size()));
+        REQUIRE(w.size() > 12);
+        CHECK(buffer[0] == 3);
+        CHECK(int32_t(vnc::readU32(&buffer[4])) == -int32_t(w.size() - 8));
+        CHECK(vnc::readU32(&buffer[8]) == (X::Provide | X::Text));
+        std::vector<uint8_t> plain(256);
+        uLongf               plainSize = uLongf(plain.size());
+        REQUIRE(uncompress(plain.data(), &plainSize, &buffer[12], uLong(w.size() - 12)) == Z_OK);
+        CHECK(std::string(plain.begin(), plain.begin() + long(plainSize)) ==
+              sized(std::string("one\r\ntwo\r\ncaf\xc3\xa9\r\n") + '\0'));
+        // And back through readText: as it was.
+        char       text[64];
+        const long n = X::readText(X::Provide | X::Text, &buffer[12], w.size() - 12, text, sizeof(text));
+        CHECK(std::string(text, size_t(n < 0 ? 0 : n)) == board.substr(0, 4) + "two\ncaf\xc3\xa9\n");
+
+        // A viewer's: a stream not ended, text then HTML (only the text taken).
+        const std::vector<uint8_t> z =
+                deflateSynced(sized(std::string("hi\r\nthere") + '\0') + sized(std::string("<b>hi</b>") + '\0'));
+        CHECK(std::string(text, size_t(X::readText(X::Provide | X::Text | X::Html, z.data(), z.size(), text,
+                                                   sizeof(text)))) == "hi\nthere");
+        // Longer than the room, without text, or broken: -1.
+        CHECK(X::readText(X::Provide | X::Text, z.data(), z.size(), text, 5) == -1);
+        CHECK(X::readText(X::Provide | X::Html, z.data(), z.size(), text, sizeof(text)) == -1);
+        CHECK(X::readText(X::Provide | X::Text, z.data(), 3, text, sizeof(text)) == -1);
+        const uint8_t junk[] = {1, 2, 3, 4, 5, 6, 7, 8};
+        CHECK(X::readText(X::Provide | X::Text, junk, sizeof(junk), text, sizeof(text)) == -1);
+
+        // Too little room: nothing written.
+        std::vector<uint8_t> small(16);
+        Writer               tight(small.data(), small.size());
+        tight.u8(9);
+        CHECK_FALSE(X::writeText(tight, board.data(), board.size()));
+        CHECK(tight.size() == 1);
+        CHECK_FALSE(tight.overflowed());
+}
+
+TEST_CASE("Extended Clipboard: the viewer's messages, and Latin-1 for the rest") {
+        Fixture f;
+        f.config.maxCutText = 64;
+        Session s(f.config, f.handler);
+        f.feed(s, text("RFB 003.008\n"));
+        f.feed(s, {1});
+        f.feed(s, {1});
+        // Caps (text up to 1 MB), a notify, then one too long to hold (skipped), then a key.
+        std::vector<uint8_t> m = hex("06000000fffffff81b0000010010000006000000fffffffc0800000106000000ffffff00");
+        m.insert(m.end(), 256, 0xaa);
+        const std::vector<uint8_t> key = hex("0401000000000041");
+        m.insert(m.end(), key.begin(), key.end());
+        size_t at = 0;
+        for (size_t end = 1; end <= m.size(); ++end) {
+                f.out.clear();
+                at += s.feed(m.data() + at, end - at, f.out);
+        }
+        CHECK(at == m.size());
+        CHECK(f.handler.clipFlags ==
+              std::vector<uint32_t>({X::Caps | X::Request | X::Notify | X::Provide | X::Text, X::Notify | X::Text}));
+        CHECK(f.handler.clipData.empty());
+        REQUIRE(f.handler.keys.size() == 1);
+        CHECK(f.handler.keys[0].second == 0x41);
+        // No room even for the flags: dropped (4 bytes is the least).
+        f.feed(s, hex("06000000fffffffe0000"));
+        CHECK(f.handler.clipFlags.size() == 2);
+        CHECK_FALSE(s.isClosed());
+
+        // A viewer without it: the board's UTF-8 as Latin-1.
+        std::vector<uint8_t> buffer(64);
+        Writer               w(buffer.data(), buffer.size());
+        REQUIRE(Session::writeCutTextFromUtf8(w, "caf\xc3\xa9 \xe2\x82\xac", 9));
+        CHECK(std::vector<uint8_t>(buffer.data(), buffer.data() + w.size()) == hex("0300000000000006636166e9203f"));
+        Writer full(buffer.data(), 10);
+        CHECK_FALSE(Session::writeCutTextFromUtf8(full, "hello", 5));
+        CHECK(full.size() == 0);
 }

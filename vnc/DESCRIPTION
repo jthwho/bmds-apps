@@ -2,8 +2,9 @@ Shares the BMDS desktop with VNC viewers: TigerVNC, TurboVNC, Remmina, noVNC, Re
 
 Flat parts of the screen and text go losslessly (fills, palettes, zlib); pictures, video and
 games go through the board's hardware JPEG encoder. Keys, the mouse, the wheel and the clipboard
-come back. Up to four viewers at once: the first in has the keyboard and mouse, the rest watch;
-the tray's Give Input To moves it.
+come back; copies go both ways, in full UTF-8 with viewers that have the Extended Clipboard
+(TigerVNC), as Latin-1 with the rest. Up to four viewers at once: the first in has the keyboard
+and mouse, the rest watch; the tray's Give Input To moves it.
 
 It listens on the board's own loopback: reach it through SSH,
     ssh -L 5900:localhost:5900 board

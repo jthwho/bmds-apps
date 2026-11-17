@@ -31,6 +31,8 @@ ap.add_argument('--bpp16', action='store_true')
 ap.add_argument('--skip', action='store_true', help='parse updates without decoding them (speed tests)')
 ap.add_argument('--seconds', type=float, default=0, help='then ask for updates this long and report the rate')
 ap.add_argument('--cut', help='text to copy (ClientCutText, Latin-1) after the first update')
+ap.add_argument('--ext-clip', action='store_true',
+                help='the Extended Clipboard (UTF-8): --cut is announced, sent when asked for')
 ap.add_argument('--watch-cut', type=float, default=0, help='then print the server\'s cut texts this long')
 a = ap.parse_args()
 
@@ -90,6 +92,7 @@ if a.bpp16:
 encs = {'raw': [0], 'zrle': [16], 'tight': [7]}[a.enc] + [-224, -223]
 if a.quality >= 0: encs.append(-32 + a.quality)
 if a.compress >= 0: encs.append(-256 + a.compress)
+if a.ext_clip: encs.append(-1063131698)  # 0xC0A1E5CE
 s.sendall(struct.pack('>BxH', 2, len(encs)) + b''.join(struct.pack('>i', e) for e in encs))
 
 fb = Image.new('RGB', (W, H))
@@ -184,6 +187,36 @@ def rect():
         raise SystemExit('encoding %d?' % e)
     return True
 
+XTEXT, XCAPS, XREQUEST, XPEEK, XNOTIFY, XPROVIDE = 1, 1 << 24, 1 << 25, 1 << 26, 1 << 27, 1 << 28
+pending_cut = [None]  # --ext-clip: the text to provide when asked
+
+def ext_send(flags, data=b''):
+    s.sendall(struct.pack('>Bxxxi', 6, -(4 + len(data))) + struct.pack('>I', flags) + data)
+
+def ext_provide(text):
+    body = text.replace('\r\n', '\n').replace('\n', '\r\n').encode() + b'\0'
+    z = zlib.compressobj()  # flushed, not ended: as TigerVNC does
+    ext_send(XPROVIDE | XTEXT, z.compress(struct.pack('>I', len(body)) + body) + z.flush(zlib.Z_SYNC_FLUSH))
+
+def ext_message(payload):
+    flags = struct.unpack('>I', payload[:4])[0]; rest = payload[4:]
+    if flags & XCAPS:
+        print('extended clipboard caps from the server: %08x, sizes %s' %
+              (flags, [struct.unpack('>I', rest[i:i+4])[0] for i in range(0, len(rest), 4)]), flush=True)
+        ext_send(XCAPS | XREQUEST | XNOTIFY | XPROVIDE | XTEXT, struct.pack('>I', 10 << 20))
+    elif flags & XNOTIFY:
+        print('extended clipboard notify from the server: %08x' % flags, flush=True)
+        if flags & XTEXT: ext_send(XREQUEST | XTEXT)
+    elif flags & XREQUEST:
+        print('extended clipboard request from the server: %08x' % flags, flush=True)
+        if pending_cut[0] is not None: ext_provide(pending_cut[0])
+    elif flags & XPROVIDE:
+        data = zlib.decompressobj().decompress(rest)
+        n = struct.unpack('>I', data[:4])[0]
+        print('extended cut text from the server: %r' % data[4:4+n].decode(errors='replace'), flush=True)
+    else:
+        print('extended clipboard message %08x?' % flags, flush=True)
+
 def update(incremental):
     s.sendall(struct.pack('>BBHHHH', 3, incremental, 0, 0, W, H))
     t0 = time.time(); total = 0
@@ -197,13 +230,17 @@ def update(incremental):
             return time.time() - t0
         elif t == 2: pass
         elif t == 3:
-            rx(3); text = rx(u32()).decode('latin-1')
+            rx(3); n = struct.unpack('>i', rx(4))[0]
+            if n < 0: ext_message(rx(-n)); continue
+            text = rx(n).decode('latin-1')
             print('cut text from the server: %r' % text, flush=True)
         else: raise SystemExit('message %d?' % t)
 
 dt = update(0)
 print('full update in %.2f s, rects by encoding %s' % (dt, stats))
-if a.cut is not None:
+if a.cut is not None and a.ext_clip:
+    pending_cut[0] = a.cut; ext_send(XNOTIFY | XTEXT)  # the server asks for it (use --watch-cut)
+elif a.cut is not None:
     data = a.cut.encode('latin-1')
     s.sendall(struct.pack('>BxxxI', 6, len(data)) + data)
 if a.point:

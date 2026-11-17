@@ -452,5 +452,38 @@ Measured on bmds0 with `-v`'s new per-update times (capture, JPEG, zlib, encode)
   past 64 KB, could never be taken whole: the viewer was dropped ("a message too long"). Remmina
   sends the PC's clipboard as it changes. Now skipped (`Session::Config::maxCutText`), tried with
   20 KB: the session went on.
-- **Waiting on the user:** the log of the next time it happens.
+- **Waiting on the user:** the log of the next time it happens. (The next log, 2026-11-17: one
+  Remmina session of 18 minutes, connected, TLS, the input, closed by the viewer: nothing wrong.)
+
+## 23. The Extended Clipboard (2026-11-17, step 5: UTF-8 copies)
+
+- **What:** rfbproto's Extended Clipboard (pseudo-encoding 0xC0A1E5CE): cut text with a negative
+  length, a flags word first (formats low, actions high: caps, request, peek, notify, provide).
+  Text only; it is UTF-8, lines CR LF, a NUL after it, and a provide's data is a zlib stream of its
+  own. `core/clipboard` writes and reads them; the session hands each message to
+  `Handler::extendedClipboard()` (one too long to hold is skipped, as cut text is).
+- **Caps:** sent after each SetEncodings that asks for it (the spec): text, and request, peek,
+  notify and provide, the text size 0, so a viewer's copy is always announced first (the spec's
+  advice) and fetched only from the viewer with the input. A viewer's own caps are kept; until it
+  sends some, the spec's defaults (text up to 20 MB; notify, request, provide).
+- **The board's copy** is kept as UTF-8 (64 KB at most, cut at a character): a viewer that takes
+  notifies is told and sends a request, then gets it; one that takes text unasked gets it at once;
+  any other (and every viewer without the encoding) gets Latin-1, as §19. Every message waits until
+  the viewer's update buffer isn't being encoded into, as §19's did.
+- **A viewer's copy:** its notify answered with a request (the viewer with the input only), its
+  provide inflated (64 KB at most, CRs before LFs dropped) and copied onto the clipboard selection.
+  A larger one is left, said in the log ("its copy not taken").
+- **zlib:** inflate vendored too (thirdparty/zlib/VENDORED.md): about 13 KB of code. A provide's
+  deflate uses a small window (2 KB, memory level 6: about 24 KB while it runs, freed after).
+- **Found on the way (the server's, since §19):** an event's strings last only until the next call
+  on the GUI connection (BMDS's gui.h), and `bmds_gui_event_is()` with a name not looked up yet is
+  such a call. The first board copy after a start came through with bytes overwritten, or not at
+  all (the selection read as some other atom). Every name the server compares is now looked up in
+  `start()`.
+- **Tried on bmds0** with `tools/vncview.py --ext-clip` (new): the board's copy ("naïve € 😀", two
+  lines) at a viewer within 12 ms of `clip copy`, whole, four fresh starts in a row; 64000 bytes
+  (2000 lines) whole; a viewer's UTF-8 copy on the board's clipboard, LF line ends; 57 KB taken, 66
+  KB left and logged; 32 KB of random text (too big for the 16 KB input buffer compressed) skipped
+  with the session going on. A viewer without it still gets Latin-1 both ways. **Not tried:**
+  TigerVNC itself.
 

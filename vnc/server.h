@@ -81,6 +81,8 @@ namespace vnc {
                                         void key(bool down, uint32_t keysym) override;
                                         void pointer(uint8_t buttons, uint16_t x, uint16_t y) override;
                                         void cutText(const char *text, size_t length) override;
+                                        void extendedClipboard(uint32_t flags, const uint8_t *data,
+                                                               size_t length) override;
 
                                 private:
                                         Server &_server;
@@ -108,7 +110,17 @@ namespace vnc {
                         void         giveInput(Viewer *v, bool chosen); // null: nobody's (None when @p chosen)
                         void         guiEvents();
                         void         clipboardEvent(const bmds_gui_event_t &e); // the board's copies
-                        void         flushCut(Viewer *v); // a board copy waiting, sent between updates
+                        // A viewer's clipboard messages (devplan/vnc.md §19, §23), sent between its updates.
+                        enum class Clip : uint8_t {
+                                Caps,
+                                Request,
+                                Notify,
+                                Copy,
+                                Provide
+                        };
+                        void flushClipboard(Viewer *v);
+                        bool writeClipboard(const Viewer *v, Clip what, Writer &w); // false: didn't fit
+                        void pasteFromViewer(Viewer *v, const char *utf8);          // its copy onto the board's
                         void notify(const char *title, const char *body, const char *urgency, uint32_t *withDisconnect);
                         // What happened, in /tmp/vncserver.log (and on stderr with -v): connections, TLS,
                         // the input, drops and why, refused injections.
@@ -127,7 +139,7 @@ namespace vnc {
                         bmds_gui_t *_gui = nullptr;
                         uint32_t    _inputShare = 0; // the ScreenShare that injects (made again as input moves)
                         uint32_t    _clipboard = 0;  // the Clipboard object (devplan/vnc.md §19)
-                        char       *_cut = nullptr;  // the board's last copy as Latin-1, to send
+                        char       *_cut = nullptr;  // the board's last copy (UTF-8), to send
                         size_t      _cutSize = 0;
                         uint32_t    _tray = 0;
                         uint32_t    _trayMenu = 0;

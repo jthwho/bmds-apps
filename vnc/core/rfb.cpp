@@ -11,6 +11,8 @@
 
 #include "rfb.h"
 
+#include "text.h"
+
 #include <cstring>
 
 namespace vnc {
@@ -271,10 +273,16 @@ namespace vnc {
                                 if (length < 8) return 0;
                                 const int32_t n = int32_t(readU32(data + 4));
                                 if (n < 0) {
-                                        // The Extended Clipboard's form (a negative length): not
-                                        // offered, so dropped (its bytes skipped).
-                                        _skip = uint32_t(-int64_t(n));
-                                        return 8;
+                                        // The Extended Clipboard's form (a negative length): its flags,
+                                        // then its data; one too long to hold whole is skipped.
+                                        const size_t m = size_t(-int64_t(n));
+                                        if (m < 4 || m > MaxCutText || m > _config.maxCutText) {
+                                                _skip = uint32_t(m);
+                                                return 8;
+                                        }
+                                        if (length < 8 + m) return 0;
+                                        _handler.extendedClipboard(readU32(data + 8), data + 12, m - 4);
+                                        return 8 + m;
                                 }
                                 if (size_t(n) > MaxCutText || size_t(n) > _config.maxCutText) {
                                         _skip = uint32_t(n);
@@ -328,6 +336,27 @@ namespace vnc {
                 out.u32(uint32_t(length));
                 out.bytes(text, length);
                 return;
+        }
+
+        bool Session::writeCutTextFromUtf8(Writer &out, const char *text, size_t length) {
+                // Latin-1 is never longer: made in place, the unused end given back.
+                const size_t start = out.size();
+                out.u8(3);
+                out.zeros(3);
+                out.u32(0);
+                uint8_t *p = out.reserve(length);
+                if (p == nullptr) {
+                        out.truncate(start);
+                        return false;
+                }
+                const size_t n = Text::latin1FromUtf8(text, length, reinterpret_cast<char *>(p), length);
+                out.drop(length - n);
+                uint8_t *len = out.data() + start + 4;
+                len[0] = uint8_t(n >> 24);
+                len[1] = uint8_t(n >> 16);
+                len[2] = uint8_t(n >> 8);
+                len[3] = uint8_t(n);
+                return true;
         }
 
 } // namespace vnc

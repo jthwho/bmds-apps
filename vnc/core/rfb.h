@@ -26,6 +26,7 @@ namespace vnc {
                 inline constexpr int32_t DesktopSize = -223;
                 inline constexpr int32_t LastRect = -224;
                 inline constexpr int32_t Cursor = -239;
+                inline constexpr int32_t ExtendedClipboard = int32_t(0xC0A1E5CE); // clipboard.h
                 inline constexpr int32_t QualityLevel0 = -32;   // to -23: 0-9
                 inline constexpr int32_t CompressLevel0 = -256; // to -247: 0-9
         } // namespace Encoding
@@ -66,6 +67,15 @@ namespace vnc {
                         /** @brief Text the viewer copied (Latin-1, as RFB has it). */
                         virtual void cutText(const char *text, size_t length) {
                                 (void)text;
+                                (void)length;
+                        }
+                        /**
+                         * @brief An Extended Clipboard message (clipboard.h): its @p flags, then @p length
+                         *        bytes at @p data (caps' sizes, a provide's zlib stream).
+                         */
+                        virtual void extendedClipboard(uint32_t flags, const uint8_t *data, size_t length) {
+                                (void)flags;
+                                (void)data;
                                 (void)length;
                         }
         };
@@ -170,6 +180,12 @@ namespace vnc {
 
                         /** @brief ServerCutText: text copied on the board (Latin-1). */
                         static void writeCutText(Writer &out, const char *text, size_t length);
+
+                        /**
+                         * @brief ServerCutText from UTF-8 (made Latin-1: `Text::latin1FromUtf8()`).
+                         * @return False if it didn't fit (nothing written).
+                         */
+                        static bool writeCutTextFromUtf8(Writer &out, const char *text, size_t length);
 
                 private:
                         size_t feedVersion(const uint8_t *data, size_t length, Writer &out);
