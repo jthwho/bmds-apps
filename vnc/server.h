@@ -27,7 +27,7 @@ namespace vnc {
                         bool     tls = false; ///< VeNCrypt only (X509Vnc: the board's certificate), on the LAN.
                         int      jpegCeiling = 80;
                         int      startWaitS = 30;
-                        char     password[64] = {}; ///< From the password file; empty: none.
+                        char     password[64] = {}; ///< From vnc/password; empty: none.
                         bool     verbose = false;   ///< -v: what happens, on stderr (the foreground's)
         };
 

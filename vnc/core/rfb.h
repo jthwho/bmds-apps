@@ -172,6 +172,13 @@ namespace vnc {
                         static void writeRectHeader(Writer &out, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                                                     int32_t encoding);
 
+                        /**
+                         * @brief A CopyRect rectangle: @p w × @p h at (@p x, @p y) from the viewer's
+                         *        own pixels at (@p fromX, @p fromY), as the rectangles before it left them.
+                         */
+                        static void writeCopyRect(Writer &out, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                                  uint16_t fromX, uint16_t fromY);
+
                         /** @brief The pseudo-rectangle saying the screen is now @p width × @p height. */
                         static void writeDesktopSize(Writer &out, uint16_t width, uint16_t height);
 

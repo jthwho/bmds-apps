@@ -93,22 +93,76 @@ namespace vnc {
 
         } // namespace
 
-        void desEncrypt(const uint8_t key[8], const uint8_t in[8], uint8_t out[8]) {
-                const uint64_t kp = permute(load(key), 64, PC1, 56);
-                uint32_t       c = uint32_t(kp >> 28) & 0x0fffffffu, d = uint32_t(kp) & 0x0fffffffu;
-                const uint64_t ip = permute(load(in), 64, IP, 64);
-                uint32_t       l = uint32_t(ip >> 32), r = uint32_t(ip);
-                for (unsigned round = 0; round < 16; ++round) {
-                        c = rotate28(c, Shifts[round]);
-                        d = rotate28(d, Shifts[round]);
-                        const uint64_t subkey = permute(uint64_t(c) << 28 | d, 56, PC2, 48);
-                        const uint32_t next = l ^ feistel(r, subkey);
-                        l = r;
-                        r = next;
+        namespace {
+
+                // One block each way: decryption is the rounds with the subkeys in reverse.
+                void des(const uint8_t key[8], const uint8_t in[8], uint8_t out[8], bool decrypt) {
+                        const uint64_t kp = permute(load(key), 64, PC1, 56);
+                        uint32_t       c = uint32_t(kp >> 28) & 0x0fffffffu, d = uint32_t(kp) & 0x0fffffffu;
+                        uint64_t       subkeys[16];
+                        for (unsigned round = 0; round < 16; ++round) {
+                                c = rotate28(c, Shifts[round]);
+                                d = rotate28(d, Shifts[round]);
+                                subkeys[round] = permute(uint64_t(c) << 28 | d, 56, PC2, 48);
+                        }
+                        const uint64_t ip = permute(load(in), 64, IP, 64);
+                        uint32_t       l = uint32_t(ip >> 32), r = uint32_t(ip);
+                        for (unsigned round = 0; round < 16; ++round) {
+                                const uint32_t next = l ^ feistel(r, subkeys[decrypt ? 15 - round : round]);
+                                l = r;
+                                r = next;
+                        }
+                        const uint64_t fp = permute(uint64_t(r) << 32 | l, 64, FP, 64); // the halves swapped
+                        for (int i = 0; i < 8; ++i) out[i] = uint8_t(fp >> (56 - 8 * i));
+                        return;
                 }
-                const uint64_t fp = permute(uint64_t(r) << 32 | l, 64, FP, 64); // the halves swapped
-                for (int i = 0; i < 8; ++i) out[i] = uint8_t(fp >> (56 - 8 * i));
+
+                // VNC's fixed key for stored passwords (vncpasswd's), its bits reversed as VNC's DES
+                // has them.
+                constexpr uint8_t StoreKey[8] = {0xe8, 0x4a, 0xd6, 0x60, 0xc4, 0x72, 0x1a, 0xe0};
+
+        } // namespace
+
+        void desEncrypt(const uint8_t key[8], const uint8_t in[8], uint8_t out[8]) {
+                des(key, in, out, false);
                 return;
+        }
+
+        void desDecrypt(const uint8_t key[8], const uint8_t in[8], uint8_t out[8]) {
+                des(key, in, out, true);
+                return;
+        }
+
+        void obfuscatePassword(const char *plain, char hex[StoredChars + 1]) {
+                uint8_t block[8] = {};
+                for (size_t i = 0; i < 8 && plain[i] != '\0'; ++i) block[i] = uint8_t(plain[i]);
+                uint8_t out[8];
+                desEncrypt(StoreKey, block, out);
+                static constexpr char Digits[] = "0123456789abcdef";
+                for (size_t i = 0; i < 8; ++i) {
+                        hex[2 * i] = Digits[out[i] >> 4];
+                        hex[2 * i + 1] = Digits[out[i] & 0xfu];
+                }
+                hex[StoredChars] = '\0';
+                for (uint8_t &b : block) b = 0;
+                return;
+        }
+
+        bool revealPassword(const char *hex, char plain[9]) {
+                uint8_t in[8];
+                for (size_t i = 0; i < 2 * 8; ++i) {
+                        const char ch = hex[i];
+                        int        v = ch >= '0' && ch <= '9'   ? ch - '0'
+                                       : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                                       : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10
+                                                                : -1;
+                        if (v < 0) return false;
+                        in[i / 2] = uint8_t(i % 2 == 0 ? v << 4 : (in[i / 2] | v));
+                }
+                if (hex[StoredChars] != '\0') return false;
+                desDecrypt(StoreKey, in, reinterpret_cast<uint8_t *>(plain));
+                plain[8] = '\0';
+                return true;
         }
 
         void vncResponse(const char *password, const uint8_t challenge[ChallengeBytes],

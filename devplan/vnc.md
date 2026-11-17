@@ -193,7 +193,8 @@ picks them; a big rectangle that turns out flat is counted from PSRAM in 8 KB st
 - **Layouts:** a viewer sends keysyms for characters; on a non-US BMDS layout, the usage for a
   keysym comes from BMDS's layout tables once they exist (BMDS's input roadmap).
 - **The password's storage** next to BMDS's own (SSH's in sysconf): one place for secrets an
-  application needs in clear.
+  application needs in clear. (Decided 2026-11-17: sysconf, §28.)
+- **Non-US layouts:** wanted later (the user, 2026-11-17), when there is a way to test them.
 - **A game in a mode of its own** without `DesktopSize` in the viewer: disconnect (proposed), or
   scale the picture into the desktop's size by the PPA.
 
@@ -234,6 +235,7 @@ warnings, and the core's tests pass on the PC under ASan and UBSan.
     in `/tmp/vncserver.pid`.
   - **The password** is in `$HOME/.config/vncserver/password` (mode 600), not sysconf: a
     `SECRET` setting reads back as "(set)", and VNC's challenge needs the password itself (§9).
+    (Since §28: sysconf's `vnc/password`.)
   - The settings it declares: `vnc/port`, `vnc/listen` (`lan` refused until VeNCrypt, A5),
     `vnc/jpeg-quality`, `vnc/start-wait`.
   - One viewer at a time; the screen watched only from its ServerInit to its leaving, so the
@@ -537,3 +539,39 @@ Measured on bmds0 with `-v`'s new per-update times (capture, JPEG, zlib, encode)
   own cursor, shown only while the mouse is over it, so nothing on the screen shows it.
 - **`-v` logs each viewer's SetEncodings** (new), for the next viewer tried.
 - **Not tried yet:** TigerVNC (not installed here).
+
+## 27. CopyRect (2026-11-17; BMDS's vnc.md §24)
+
+- A viewer listing CopyRect (Remmina does, §26) gives its captures room for 16 copies
+  (`bmds_screen_capture_t::copies`, BMDS's §24 C4); its next update starts with them as CopyRect
+  rectangles in order (`Session::writeCopyRect()`, host-tested), then the rectangles. A BMDS
+  without them leaves `copy_count` 0: rectangles as before. Taken up between jobs, like Cursor.
+- `tools/vncview.py --copyrect` (new): copies applied (read whole, then written) and printed.
+- **Tried on bmds0:** see BMDS's §24: every move of a run of 7 came as one copy, the viewer's
+  picture the board's exactly.
+
+## 28. The password in sysconf (2026-11-17, the user's: "VNC password in the sysconf is fine")
+
+- **`vnc/password`**, a secret the server declares (shown as "(set)"). The user's rule: not stored
+  plain, hashed and salted where possible. Not possible here: VNC's challenge encrypts with the
+  password itself, so the server needs it back. Kept as VNC keeps them (vncpasswd's, TigerVNC's):
+  its first 8 bytes DES-encrypted with VNC's fixed key, in hex (`obfuscatePassword()`,
+  `revealPassword()`, host-tested against TigerVNC's vector for "password", `dbd83cfd727a1458`).
+  That keeps it out of sight (a listing, a look at the store), not from anyone with the board.
+- **Read back** through BMDS's new `BMDS_SYSCONF_FIELD_SECRET` (its vnc.md §25): a BMDS before it
+  gives no password, so `lan` is refused as without one.
+- **`vncserver passwd`** reads it unechoed at a terminal, or piped in; empty clears it. The old
+  file isn't read (nothing released used it); the user's password on bmds0 was moved over with
+  `vncserver passwd < FILE` and the file removed.
+- **Tried on bmds0:** the store holds `vnc/password=104260278fd1bbd0` for the test password, not
+  the password; the right one gets in, a wrong one is refused.
+
+## 29. Wrong passwords on loopback (2026-11-17)
+
+- Through an SSH tunnel every viewer comes from 127.0.0.1, so three wrong passwords locked every
+  tunnel out for a minute. Whoever reaches loopback is in the board already (and can read
+  `vnc/password`): a lockout there protects nothing and lets one of them shut out the rest. Now a
+  wrong password from 127.0.0.0/8 is only told (the "wrong password" notification), never
+  counted. The LAN's lockout (3 within a minute, an address, a minute) is as it was.
+- **Tried on bmds0:** through `ssh -L`, four wrong passwords then the right one got in; from the
+  LAN, the fourth try and the right one after it were refused.

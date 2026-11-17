@@ -20,6 +20,26 @@ namespace vnc {
          */
         void desEncrypt(const uint8_t key[8], const uint8_t in[8], uint8_t out[8]);
 
+        /** @brief DES decryption of one block (a stored password's: `revealPassword()`). */
+        void desDecrypt(const uint8_t key[8], const uint8_t in[8], uint8_t out[8]);
+
+        /** @brief A stored password's characters: 8 bytes in hex. */
+        inline constexpr size_t StoredChars = 16;
+
+        /**
+         * @brief @p plain (its first 8 bytes) as VNC stores passwords (vncpasswd's, TigerVNC's):
+         *        DES with VNC's fixed key, in hex. Not a secret from anyone with the board: the
+         *        challenge needs the password itself, so it can't be a hash; it only keeps it out of
+         *        sight (devplan/vnc.md §28).
+         */
+        void obfuscatePassword(const char *plain, char hex[StoredChars + 1]);
+
+        /**
+         * @brief The password @p hex stores (`obfuscatePassword()`), NUL-ended in @p plain.
+         * @return False if @p hex isn't 16 hex digits.
+         */
+        bool revealPassword(const char *hex, char plain[9]);
+
         /** @brief The challenge's bytes. */
         inline constexpr size_t ChallengeBytes = 16;
 

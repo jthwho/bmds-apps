@@ -320,6 +320,14 @@ namespace vnc {
                 return;
         }
 
+        void Session::writeCopyRect(Writer &out, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t fromX,
+                                    uint16_t fromY) {
+                writeRectHeader(out, x, y, w, h, Encoding::CopyRect);
+                out.u16(fromX);
+                out.u16(fromY);
+                return;
+        }
+
         void Session::writeLastRect(Writer &out) {
                 writeRectHeader(out, 0, 0, 0, 0, Encoding::LastRect);
                 return;

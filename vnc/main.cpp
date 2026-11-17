@@ -12,9 +12,11 @@
  *     vncserver -f         start, in the foreground (what the background one runs)
  *     vncserver stop       stop the running one
  *     vncserver status     say whether one runs, and where it listens
- *     vncserver passwd     set the password viewers give (read from the terminal)
+ *     vncserver passwd     set the password viewers give (read from the terminal, or piped in):
+ *                          sysconf's vnc/password, a secret, kept as VNC keeps them (devplan/vnc.md §28)
  */
 
+#include "des.h"
 #include "server.h"
 
 #include <bmds/sys.h>
@@ -25,7 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
-#include <sys/stat.h>
+#include <termios.h>
 #include <unistd.h>
 
 namespace {
@@ -58,6 +60,18 @@ namespace {
                  "tls|none", 0, 0},
         };
 
+        // The password viewers give: a secret (shown as "(set)"), VNC's way of storing them (DES
+        // with VNC's fixed key, in hex; devplan/vnc.md §28): the challenge needs the password
+        // itself, so it can't be a hash.
+        constexpr Param PasswordParam = {"vnc/password",
+                                         BMDS_SYSCONF_TYPE_SECRET,
+                                         "",
+                                         "The VNC server's password, as VNC stores them; set with 'vncserver passwd' "
+                                         "(empty: none)",
+                                         nullptr,
+                                         0,
+                                         0};
+
         // A declared setting's value into @p out (its default if it can't be read).
         void setting(const Param &p, char *out, size_t size) {
                 bmds_sysconf_param_t d = {};
@@ -76,55 +90,71 @@ namespace {
                 return;
         }
 
-        // The password file: the user's config folder (the VNC challenge needs the password itself,
-        // so it can't be a system secret, which reads back as "(set)").
-        void passwordPath(char *out, size_t size) {
-                const char *home = getenv("HOME");
-                snprintf(out, size, "%s/.config/vncserver/password", home != nullptr ? home : "/home");
-                return;
+        // The password setting, declared: its id, or -1.
+        int32_t passwordId() {
+                const Param         &p = PasswordParam;
+                bmds_sysconf_param_t d = {};
+                d.size = sizeof(d);
+                d.type = p.type;
+                d.key = p.key;
+                d.default_value = p.def;
+                d.help = p.help;
+                int32_t id = bmds_sysconf_declare(&d);
+                if (id < 0) id = bmds_sysconf_find(p.key);
+                return id;
         }
 
         bool readPassword(char *out, size_t size) {
-                char path[256];
-                passwordPath(path, sizeof(path));
-                FILE *f = fopen(path, "r");
-                if (f == nullptr) return false;
-                const bool ok = fgets(out, int(size), f) != nullptr;
-                fclose(f);
-                if (!ok) return false;
-                out[strcspn(out, "\r\n")] = '\0';
+                out[0] = '\0';
+                const int32_t id = passwordId();
+                char          stored[vnc::StoredChars + 2];
+                // The value itself (a BMDS before BMDS_SYSCONF_FIELD_SECRET: none).
+                if (id < 0 || bmds_sysconf_get(id, BMDS_SYSCONF_FIELD_SECRET, stored, sizeof(stored)) <= 0)
+                        return false;
+                char plain[9];
+                if (!vnc::revealPassword(stored, plain)) {
+                        fprintf(stderr, "vncserver: vnc/password isn't one 'vncserver passwd' set: set it again\n");
+                        return false;
+                }
+                snprintf(out, size, "%s", plain);
+                memset(plain, 0, sizeof(plain));
                 return out[0] != '\0';
         }
 
         int setPassword() {
-                char path[256], line[64];
-                passwordPath(path, sizeof(path));
-                printf("Password for VNC viewers (8 characters count; empty for none): ");
-                fflush(stdout);
-                if (fgets(line, sizeof(line), stdin) == nullptr) return 1;
-                line[strcspn(line, "\r\n")] = '\0';
-                // The folders, then the file, readable by its owner only.
-                char dir[256];
-                snprintf(dir, sizeof(dir), "%s", path);
-                for (char *p = dir + 1; *p != '\0'; ++p) {
-                        if (*p != '/') continue;
-                        *p = '\0';
-                        (void)mkdir(dir, 0700);
-                        *p = '/';
+                char line[64];
+                // Not echoed at a terminal.
+                struct termios was;
+                const bool     tty = isatty(0) && tcgetattr(0, &was) == 0;
+                if (tty) {
+                        struct termios quiet = was;
+                        quiet.c_lflag &= ~tcflag_t(ECHO);
+                        (void)tcsetattr(0, TCSANOW, &quiet);
+                        printf("Password for VNC viewers (8 characters count; empty for none): ");
+                        fflush(stdout);
                 }
-                if (line[0] == '\0') {
-                        (void)unlink(path);
+                const bool got = fgets(line, sizeof(line), stdin) != nullptr;
+                if (tty) {
+                        (void)tcsetattr(0, TCSANOW, &was);
+                        printf("\n");
+                }
+                if (!got) return 1;
+                line[strcspn(line, "\r\n")] = '\0';
+                const int32_t id = passwordId();
+                char          stored[vnc::StoredChars + 1] = "";
+                if (line[0] != '\0') vnc::obfuscatePassword(line, stored);
+                const size_t length = strlen(line);
+                memset(line, 0, sizeof(line));
+                if (id < 0 || bmds_sysconf_set(id, BMDS_SYSCONF_OP_SET, stored) < 0 ||
+                    bmds_sysconf_set(id, BMDS_SYSCONF_OP_SAVE, nullptr) < 0) {
+                        fprintf(stderr, "vncserver: vnc/password couldn't be saved\n");
+                        return 1;
+                }
+                if (stored[0] == '\0') {
                         printf("vncserver: no password: viewers on the board's loopback get in without one\n");
                         return 0;
                 }
-                const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-                if (fd < 0 || write(fd, line, strlen(line)) < 0 || write(fd, "\n", 1) != 1) {
-                        perror(path);
-                        if (fd >= 0) close(fd);
-                        return 1;
-                }
-                close(fd);
-                if (strlen(line) > 8) printf("vncserver: VNC uses the first 8 characters only\n");
+                if (length > 8) printf("vncserver: VNC uses the first 8 characters only\n");
                 printf("vncserver: the new password counts from the next start\n");
                 return 0;
         }

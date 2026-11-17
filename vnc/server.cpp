@@ -47,6 +47,7 @@ namespace vnc {
                 constexpr size_t      OutBytes = 384 * 1024;     // an update at most (a 2048-wide band's worst case)
                 constexpr size_t      CaptureBytes = 256 * 1024; // a capture's pixels (a 2048-wide tile row at least)
                 constexpr uint32_t    MaxRects = 64;
+                constexpr uint32_t    MaxCopies = 16;           // BMDS gives at most 16 a capture
                 constexpr uint64_t    PointerStillMs = 500;     // a viewer's mouse still this long: PointerPos again
                 constexpr uint16_t    BandRows = 16;            // a rectangle is encoded in bands of these
                 constexpr uint32_t    MaxRectsAnUpdate = 60000; // under the header's 16 bits
@@ -128,6 +129,12 @@ namespace vnc {
                         int32_t  posSentX = -1;
                         int32_t  posSentY = -1;
                         uint64_t movedMs = 0;        // its own last pointer event
+                        // CopyRect (devplan/vnc.md §27, BMDS's §24): a window's move as copies of the
+                        // viewer's own pixels, from its last capture, sent before its rectangles.
+                        bool               wantsCopyRect = false;
+                        bool               copyRect = false; // in use (its encoder's settings, idle)
+                        bmds_screen_copy_t copies[MaxCopies];
+                        uint32_t           copyCount = 0;
                         unsigned refused = 0;        // injections the system refused (the first few logged)
                         // The viewer's SetPixelFormat and SetEncodings while the worker encodes: kept,
                         // and given to the encoder before the next job.
@@ -761,6 +768,10 @@ namespace vnc {
                 c.max_rects = MaxRects;
                 c.share = v->screen;
                 c.pointer_x = c.pointer_y = -2; // a BMDS before them leaves these
+                if (v->copyRect) {
+                        c.copies = v->copies;
+                        c.max_copies = MaxCopies;
+                }
                 int32_t r = bmds_gui_screen_capture(bmds_gui_fd(_gui), &c);
                 if (r == -BMDS_EINVAL && v->cursor) {
                         // A BMDS without captures leaving the pointer out (start() said it had them):
@@ -775,6 +786,7 @@ namespace vnc {
                 v->rectAt = 0;
                 v->bandAt = 0;
                 v->more = c.more != 0;
+                v->copyCount = c.copy_count <= MaxCopies ? c.copy_count : 0; // (0 from a BMDS before them)
                 v->boardX = c.pointer_x >= 0 ? c.pointer_x : -1;
                 v->boardY = c.pointer_x >= 0 ? c.pointer_y : -1;
                 v->capturedWidth = uint16_t(c.width);
@@ -856,6 +868,7 @@ namespace vnc {
                 v->encoder.setEncodings(v->encodings, v->encodingCount);
                 const bool cursor = v->wantsCursor && _cursorAble;
                 v->pointerPos = cursor && v->wantsPointerPos != 0;
+                v->copyRect = v->wantsCopyRect;
                 if (cursor != v->cursor) {
                         v->cursor = cursor;
                         v->cursorSent = 0;
@@ -969,6 +982,14 @@ namespace vnc {
                                 ++count;
                         }
                 }
+                // A window's move: copies of what the viewer has, before the rectangles drawn over them.
+                for (uint32_t i = 0; i < v->copyCount; ++i) {
+                        const bmds_screen_copy_t &k = v->copies[i];
+                        Session::writeCopyRect(out, uint16_t(k.to_x), uint16_t(k.to_y), uint16_t(k.from.width),
+                                               uint16_t(k.from.height), uint16_t(k.from.x), uint16_t(k.from.y));
+                        ++count;
+                }
+                v->copyCount = 0;
                 const uint8_t *pixels = _pixels;
                 while (v->rectAt < v->rectCount && count < MaxRectsAnUpdate) {
                         const bmds_rect_t &r = v->rects[v->rectAt];
@@ -1168,6 +1189,7 @@ namespace vnc {
                 v->pendingEncodings = true;
                 v->wantsCursor = v->wantsAlpha = false;
                 v->wantsPointerPos = 0;
+                v->wantsCopyRect = false;
                 if (_server._settings.verbose) {
                         // What a viewer asks for, as it lists it (a real viewer's choices, -v).
                         fprintf(stderr, "%s: encodings", v->name);
@@ -1177,6 +1199,7 @@ namespace vnc {
                 for (size_t i = 0; i < count; ++i) {
                         const int32_t e = encodings[i];
                         if (e == Encoding::Cursor) v->wantsCursor = true;
+                        if (e == Encoding::CopyRect) v->wantsCopyRect = true;
                         if (e == Encoding::CursorWithAlpha) v->wantsCursor = v->wantsAlpha = true;
                         if ((e == Encoding::PointerPos || e == Encoding::VmwareCursorPosition) &&
                             v->wantsPointerPos == 0)
@@ -1391,7 +1414,14 @@ namespace vnc {
         }
 
         // A wrong password from @p address: told; the third within a minute refuses it for a minute.
+        // Not on loopback (an SSH tunnel's viewers all come from 127.0.0.1): whoever is there is in
+        // the board already (and can read vnc/password), and one of them would lock out the rest.
         void Server::failedFrom(uint32_t address) {
+                if ((ntohl(address) >> 24) == 127) {
+                        notify("VNC: wrong password", "A viewer on the board (an SSH tunnel) gave a wrong password",
+                               "normal", nullptr);
+                        return;
+                }
                 const uint64_t now = nowMs();
                 Failure       *slot = &_failures[0];
                 for (Failure &f : _failures) {

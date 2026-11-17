@@ -145,6 +145,24 @@ TEST_CASE("DES: VNC's response, its key's bits reversed (checked with OpenSSL)")
         CHECK(std::vector<uint8_t>(response, response + 16) == hex("a1ce096f55fcf9a3f8a6f834df6cc386"));
 }
 
+TEST_CASE("DES: a stored password, as TigerVNC's vncpasswd stores it (checked with OpenSSL)") {
+        char hex[vnc::StoredChars + 1];
+        vnc::obfuscatePassword("password", hex);
+        CHECK(std::string(hex) == "dbd83cfd727a1458");
+        vnc::obfuscatePassword("trytest1and more", hex); // the first 8
+        CHECK(std::string(hex) == "104260278fd1bbd0");
+        vnc::obfuscatePassword("abc", hex);
+        CHECK(std::string(hex) == "9c0a172d3482e122");
+        char plain[9];
+        REQUIRE(vnc::revealPassword("9C0A172D3482E122", plain));
+        CHECK(std::string(plain) == "abc");
+        REQUIRE(vnc::revealPassword("dbd83cfd727a1458", plain));
+        CHECK(std::string(plain) == "password");
+        CHECK_FALSE(vnc::revealPassword("dbd83cfd727a145", plain));   // short
+        CHECK_FALSE(vnc::revealPassword("dbd83cfd727a14588", plain)); // long
+        CHECK_FALSE(vnc::revealPassword("dbd83cfd727a145g", plain));
+}
+
 TEST_CASE("RFB 3.8 without a password") {
         Fixture f;
         Session s(f.config, f.handler);
@@ -560,4 +578,12 @@ TEST_CASE("Cursor With Alpha: Raw, R G B A, the colours multiplied by alpha") {
         Writer small(buffer.data(), 20);
         CHECK_FALSE(Session::writeCursorWithAlpha(small, 2, 1, 1, 0, argb));
         CHECK(small.size() == 0);
+}
+
+TEST_CASE("CopyRect: the destination, then the source") {
+        std::vector<uint8_t> buffer(32);
+        Writer               w(buffer.data(), buffer.size());
+        Session::writeCopyRect(w, 0x10, 0x20, 0x300, 0x40, 0x0102, 0x0304);
+        CHECK(std::vector<uint8_t>(buffer.data(), buffer.data() + w.size()) == hex("0010002003000040000000010102"
+                                                                                   "0304"));
 }

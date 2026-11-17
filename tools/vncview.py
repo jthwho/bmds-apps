@@ -31,6 +31,7 @@ ap.add_argument('--bpp16', action='store_true')
 ap.add_argument('--skip', action='store_true', help='parse updates without decoding them (speed tests)')
 ap.add_argument('--seconds', type=float, default=0, help='then ask for updates this long and report the rate')
 ap.add_argument('--cut', help='text to copy (ClientCutText, Latin-1) after the first update')
+ap.add_argument('--copyrect', action='store_true', help='CopyRect: copies of the viewer\'s own pixels (a window moved), counted')
 ap.add_argument('--cursor', action='store_true',
                 help='the Cursor pseudo-encoding: the viewer draws the pointer (its shapes printed)')
 ap.add_argument('--alpha', action='store_true', help='with --cursor: Cursor With Alpha (-314) asked for too')
@@ -99,6 +100,7 @@ if a.quality >= 0: encs.append(-32 + a.quality)
 if a.compress >= 0: encs.append(-256 + a.compress)
 if a.ext_clip: encs.append(-1063131698)  # 0xC0A1E5CE
 if a.cursor: encs.append(-239)
+if a.copyrect: encs.insert(0, 1)
 if a.cursor and a.alpha: encs.insert(0, -314)
 if a.pointer_pos: encs.append(-232 if a.pointer_pos == 'tight' else 0x574d5666)
 s.sendall(struct.pack('>BxH', 2, len(encs)) + b''.join(struct.pack('>i', e) for e in encs))
@@ -139,6 +141,11 @@ def rect():
     stats[e] = stats.get(e, 0) + 1
     if e in (-232, 0x574d5666):
         print('pointer at %d,%d' % (x, y), flush=True)
+        return True
+    if e == 1:
+        sx, sy = struct.unpack('>HH', rx(4))
+        if not a.skip: fb.paste(fb.crop((sx, sy, sx + w, sy + h)), (x, y))  # read whole, then written
+        print('copy %dx%d from %d,%d to %d,%d' % (w, h, sx, sy, x, y), flush=True)
         return True
     if e == -314:
         if struct.unpack('>i', rx(4))[0] != 0: raise SystemExit('cursor with alpha: not raw?')
