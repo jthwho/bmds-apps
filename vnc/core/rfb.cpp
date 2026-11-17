@@ -20,6 +20,8 @@ namespace vnc {
                 constexpr size_t  VersionBytes = 12;
                 constexpr uint8_t SecurityNone = 1;
                 constexpr uint8_t SecurityVnc = 2;
+                constexpr uint8_t  SecurityVencrypt = 19; // VeNCrypt: TLS, then a subtype's authentication
+                constexpr uint32_t VencryptX509Vnc = 261; // TLS with the server's certificate, then VNC's
 
                 // The viewer's messages (RFB 3.8 §7.5).
                 constexpr uint8_t SetPixelFormat = 0;
@@ -53,6 +55,13 @@ namespace vnc {
                         switch (_state) {
                                 case State::Version: n = feedVersion(data + taken, length - taken, out); break;
                                 case State::Security: n = feedSecurity(data + taken, length - taken, out); break;
+                                case State::VencryptVersion:
+                                        n = feedVencryptVersion(data + taken, length - taken, out);
+                                        break;
+                                case State::VencryptSubtype:
+                                        n = feedVencryptSubtype(data + taken, length - taken, out);
+                                        break;
+                                case State::Tls: break; // nothing until TLS is up (the viewer sends its hello to it)
                                 case State::Challenge: n = feedChallenge(data + taken, length - taken, out); break;
                                 case State::Init: n = feedInit(data + taken, length - taken, out); break;
                                 case State::Normal: n = feedMessage(data + taken, length - taken); break;
@@ -80,7 +89,18 @@ namespace vnc {
                         minor = minor * 10 + (data[i] - '0');
                 }
                 _minor = minor >= 8 ? 8 : minor == 7 ? 7 : 3;
-                const uint8_t type = _config.password != nullptr ? SecurityVnc : SecurityNone;
+                if (_config.vencrypt && _minor == 3) {
+                        // 3.3 has the server choose a type: VeNCrypt needs the viewer's choice.
+                        out.u32(0);
+                        const char *why = "this server needs VeNCrypt (TLS): a viewer speaking RFB 3.7 or later";
+                        out.u32(uint32_t(std::strlen(why)));
+                        out.bytes(why, std::strlen(why));
+                        close("an RFB 3.3 viewer (no VeNCrypt)");
+                        return VersionBytes;
+                }
+                const uint8_t type = _config.vencrypt              ? SecurityVencrypt
+                                     : _config.password != nullptr ? SecurityVnc
+                                                                   : SecurityNone;
                 if (_minor == 3) {
                         // 3.3: the server chooses.
                         out.u32(type);
@@ -100,10 +120,18 @@ namespace vnc {
 
         size_t Session::feedSecurity(const uint8_t *data, size_t length, Writer &out) {
                 if (length < 1) return 0;
-                const uint8_t want = _config.password != nullptr ? SecurityVnc : SecurityNone;
+                const uint8_t want = _config.vencrypt              ? SecurityVencrypt
+                                     : _config.password != nullptr ? SecurityVnc
+                                                                   : SecurityNone;
                 if (data[0] != want) {
                         securityResult(out, false, "that security type isn't offered");
                         close("the viewer chose a security type not offered");
+                        return 1;
+                }
+                if (want == SecurityVencrypt) {
+                        out.u8(0); // VeNCrypt 0.2
+                        out.u8(2);
+                        _state = State::VencryptVersion;
                         return 1;
                 }
                 if (want == SecurityVnc) {
@@ -114,6 +142,41 @@ namespace vnc {
                 if (_minor >= 8) securityResult(out, true, nullptr); // 3.7 sends none for None
                 _state = State::Init;
                 return 1;
+        }
+
+        // VeNCrypt (its 0.2): the viewer's version, then the subtypes (X509Vnc alone), its choice
+        // acknowledged, and TLS: the caller's (`tlsStarted()`).
+        size_t Session::feedVencryptVersion(const uint8_t *data, size_t length, Writer &out) {
+                if (length < 2) return 0;
+                if (data[0] != 0 || data[1] != 2) {
+                        out.u8(1); // not supported
+                        close("a VeNCrypt version other than 0.2");
+                        return 2;
+                }
+                out.u8(0);
+                out.u8(1);
+                out.u32(VencryptX509Vnc);
+                _state = State::VencryptSubtype;
+                return 2;
+        }
+
+        size_t Session::feedVencryptSubtype(const uint8_t *data, size_t length, Writer &out) {
+                if (length < 4) return 0;
+                if (readU32(data) != VencryptX509Vnc) {
+                        out.u8(0);
+                        close("the viewer chose a VeNCrypt subtype not offered");
+                        return 4;
+                }
+                out.u8(1);
+                _state = State::Tls;
+                return 4;
+        }
+
+        void Session::tlsStarted(Writer &out) {
+                if (_state != State::Tls) return;
+                sendChallenge(out);
+                _state = State::Challenge;
+                return;
         }
 
         void Session::sendChallenge(Writer &out) {
@@ -213,7 +276,7 @@ namespace vnc {
                                         _skip = uint32_t(-int64_t(n));
                                         return 8;
                                 }
-                                if (size_t(n) > MaxCutText) {
+                                if (size_t(n) > MaxCutText || size_t(n) > _config.maxCutText) {
                                         _skip = uint32_t(n);
                                         return 8;
                                 }

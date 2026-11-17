@@ -384,3 +384,73 @@ Measured on bmds0 with `-v`'s new per-update times (capture, JPEG, zlib, encode)
 - **Then the capture's wait** (BMDS's vnc.md §16): the desktop's latest present copied without the
   window manager's lock; a capture under load 11 ms (21-33); scrolling 4.5 Mpixel/s at level 0,
   2.5 at level 6, nothing changed here.
+
+## 19. The clipboard both ways (2026-11-17, step 5's first part)
+
+- **The viewer's copy** (ClientCutText, Latin-1) goes onto the board's clipboard selection as
+  UTF-8 (`core/text`: CR LF as LF), with `copyText`; the server owns it then, so its own copy's
+  `changed` isn't sent back.
+- **The board's copy:** BMDS's new `Clipboard.changed` (its vnc.md §17) for the clipboard
+  selection, not ours: pasted as `text/plain;charset=utf-8`, made Latin-1 (`?` for what Latin-1
+  lacks), 64 KB at most, sent as ServerCutText between updates (never into the buffer the worker
+  is encoding into). Nothing is sent as a viewer connects; only changes while it is in.
+- **Tried on bmds0** with `tools/vncview.py --cut TEXT --watch-cut SECONDS` (both new): "café"
+  from the viewer pasted on the board; `clip copy` on the board reached the viewer within a second
+  ("naïve" whole, the euro sign `?`), two lines as two lines; no echo of the viewer's own copy.
+- **Next:** the Extended Clipboard (UTF-8, its messages zlib-compressed: inflate added to the
+  vendored zlib, about 10 KB); then several viewers and VeNCrypt, both waiting on BMDS (its
+  vnc.md §18).
+
+## 20. VeNCrypt on the LAN (2026-11-17, step 4; BMDS's TLS servers, its network.md §37)
+
+- **The core** (`Session::Config::vencrypt`): security type 19 alone, VeNCrypt 0.2, the subtype
+  X509Vnc (261) alone; acknowledged, the session waits (`State::Tls`, nothing read) until the
+  caller says TLS is up (`tlsStarted()`), then VNC's challenge inside it. RFB 3.3 viewers (the
+  server would choose) are refused with a reason. Host-tested: the bytes each way, refusals.
+- **The server:** once the acknowledgement is all sent, `tls_ctl(BMDS_TLS_START, SERVER)` on the
+  socket, no certificate given: the board's. The viewer sends nothing before it has that byte, so
+  nothing is read in the clear meanwhile. A failed handshake drops the viewer ("TLS failed").
+- **`vnc/encryption`** (new): `tls` (the default) or `none`, on the LAN only; loopback stays plain
+  VNC authentication (the SSH tunnel is the encryption). `none` is for viewers without VeNCrypt
+  (TightVNC, macOS's Screen Sharing): the password alone, as §13 had it, its warning kept.
+- **Tried on bmds0** with `tools/vncview.py` (VeNCrypt by Python's `ssl`): TLS 1.2
+  ECDHE-ECDSA-AES128-GCM-SHA256 in 0.16 s, the fingerprint the one `tls cert` shows, updates as
+  fast as without; a wrong password refused inside TLS. **Not tried:** TigerVNC itself.
+
+## 21. Several viewers (2026-11-17, the user's rules)
+
+- **Rules:** the first viewer in has the keys, the pointer and its clipboard copies; the others
+  watch (their input ignored). When it leaves, the next in the order they came has them. The tray's
+  Give Input To lists the viewers (checked: who has it) and None; None holds until all have left.
+  Moving the input lets go of injected keys and buttons (the injecting ScreenShare is made again:
+  BMDS releases what an object pressed). A notification says who has it when there are several.
+- **Each viewer** its own ScreenShare (its own changes, BMDS's vnc.md §19), session, encoder and
+  update buffer; up to four (BMDS's watches). Numbered as they come ("Viewer 2 (ADDRESS)"): two
+  from one machine look alike otherwise. The board's copies go to every viewer.
+- **One capture buffer for all** (the user: no copy of the screen in the server), 256 KB: a capture
+  takes at most what one update always carries in the viewer's format (raw, the worst), so no
+  rectangles wait in it for a viewer's next update while another captures over them; if some do,
+  their owner goes first, and is otherwise sent everything again. Jobs go to viewers in turns.
+- **Memory:** about 650 KB a viewer (its 384 KB update buffer, its encoder's 256 KB) and the
+  256 KB capture buffer once.
+- **Tried on bmds0:** two viewers then four in turn; typing from the first reached a terminal, the
+  second's didn't; the first gone, the next one's did; a later one's didn't. The tray's submenu
+  moved the input (and None stopped it), its notification shown.
+
+## 22. A log, and long copies (2026-11-17, the user's report: the mouse stopped under Remmina)
+
+- **Reported:** connected through Remmina (VeNCrypt), the mouse stopped after a few minutes; after
+  disconnecting and connecting again the picture came but the mouse still didn't work. Nothing
+  recorded it: the background server's stderr is /dev/null. Not reproduced: three minutes of pointer
+  moves over TLS from `tools/vncview.py --wiggle` (3813 updates) all arrived; after a restart a
+  pointer move through VNC landed where sent. One explanation fits both halves: the first
+  connection stalled without closing, kept the input, and the reconnection came in watching.
+- **`/tmp/vncserver.log`** (beside the pid file; RAM, so 32 KB and then afresh): connections, TLS,
+  watching, who has the input and why, drops and their reasons, the first five injections the
+  system refuses a viewer.
+- **Found on the way:** a viewer's copy (ClientCutText) longer than the 16 KB input buffer, and not
+  past 64 KB, could never be taken whole: the viewer was dropped ("a message too long"). Remmina
+  sends the PC's clipboard as it changes. Now skipped (`Session::Config::maxCutText`), tried with
+  20 KB: the session went on.
+- **Waiting on the user:** the log of the next time it happens.
+

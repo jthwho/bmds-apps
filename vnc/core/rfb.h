@@ -85,6 +85,9 @@ namespace vnc {
                         enum class State : uint8_t {
                                 Version,   ///< Waiting for the viewer's ProtocolVersion.
                                 Security,  ///< Waiting for its choice of security (3.7, 3.8).
+                                VencryptVersion, ///< VeNCrypt: waiting for the viewer's version (0.2).
+                                VencryptSubtype, ///< VeNCrypt: waiting for its subtype (X509Vnc).
+                                Tls,             ///< VeNCrypt: waiting for the caller to start TLS (`tlsStarted()`).
                                 Challenge, ///< Waiting for its answer to VNC's challenge.
                                 Init,      ///< Waiting for its ClientInit.
                                 Normal,    ///< Messages.
@@ -99,6 +102,13 @@ namespace vnc {
                                         uint16_t    width = 0;     ///< The screen's.
                                         uint16_t    height = 0;
                                         const char *password = nullptr; ///< VNC authentication's; null: none asked.
+                                        /**
+                                         * Only VeNCrypt's X509Vnc offered (with a password): TLS (the
+                                         * caller's, at `State::Tls`), then VNC authentication inside it.
+                                         */
+                                        bool vencrypt = false;
+                                        /** The longest cut text kept (the caller's input buffer's room); longer ones are skipped. */
+                                        size_t maxCutText = MaxCutText;
                                         /** Fills @p n bytes with randomness (VNC's challenge). */
                                         void (*random)(void *arg, uint8_t *out, size_t n) = nullptr;
                                         void *randomArg = nullptr;
@@ -120,6 +130,12 @@ namespace vnc {
                         State       state() const { return _state; }
                         bool        isClosed() const { return _state == State::Closed; }
                         const char *closeReason() const { return _reason; }
+
+                        /**
+                         * @brief VeNCrypt: the caller has started TLS on the connection (everything
+                         *        written before it sent in the clear first): the challenge follows.
+                         */
+                        void tlsStarted(Writer &out);
 
                         /** @brief The version the viewer speaks: 3, 7 or 8 (RFB 3.x). */
                         int minorVersion() const { return _minor; }
@@ -158,6 +174,8 @@ namespace vnc {
                 private:
                         size_t feedVersion(const uint8_t *data, size_t length, Writer &out);
                         size_t feedSecurity(const uint8_t *data, size_t length, Writer &out);
+                        size_t feedVencryptVersion(const uint8_t *data, size_t length, Writer &out);
+                        size_t feedVencryptSubtype(const uint8_t *data, size_t length, Writer &out);
                         size_t feedChallenge(const uint8_t *data, size_t length, Writer &out);
                         size_t feedInit(const uint8_t *data, size_t length, Writer &out);
                         size_t feedMessage(const uint8_t *data, size_t length);

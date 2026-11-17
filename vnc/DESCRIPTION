@@ -1,13 +1,16 @@
-Shares the BMDS desktop with VNC viewers: TigerVNC, TurboVNC, noVNC, RealVNC.
+Shares the BMDS desktop with VNC viewers: TigerVNC, TurboVNC, Remmina, noVNC, RealVNC.
 
 Flat parts of the screen and text go losslessly (fills, palettes, zlib); pictures, video and
-games go through the board's hardware JPEG encoder. Keys, the mouse and the wheel come back.
+games go through the board's hardware JPEG encoder. Keys, the mouse, the wheel and the clipboard
+come back. Up to four viewers at once: the first in has the keyboard and mouse, the rest watch;
+the tray's Give Input To moves it.
 
 It listens on the board's own loopback: reach it through SSH,
     ssh -L 5900:localhost:5900 board
 then point a viewer at localhost:5900. Set a password with 'vncserver passwd'. With the setting
-vnc/listen at lan (and a password) it listens on the network too, but VNC isn't encrypted there:
-the tunnel is the safer way. Start it with
-'vncserver' (from autoexec.sh, or over SSH); 'vncserver stop' ends it. While it runs it has an
-icon in the tray (a red dot on it while a viewer is in), and a viewer coming or going shows a
-notification.
+vnc/listen at lan (and a password) it listens on the network too, with TLS (VeNCrypt) and the
+board's own certificate: 'tls cert' shows the fingerprint a viewer asks you to accept. Viewers
+without VeNCrypt (TightVNC) need vnc/encryption at none: the password alone, readable on the wire.
+Start it with 'vncserver' (from autoexec.sh, or over SSH); 'vncserver stop' ends it. While it runs
+it has an icon in the tray (a red dot on it while a viewer is in), and a viewer coming or going
+shows a notification.

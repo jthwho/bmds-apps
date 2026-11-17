@@ -12,6 +12,7 @@
 #include "des.h"
 #include "keysym.h"
 #include "rfb.h"
+#include "text.h"
 
 #include <doctest.h>
 
@@ -176,6 +177,59 @@ TEST_CASE("RFB 3.8 with VNC authentication: right, then wrong") {
         }
 }
 
+TEST_CASE("RFB 3.8 with VeNCrypt X509Vnc: the subtype, TLS, then VNC authentication") {
+        uint8_t challenge[16], response[16];
+        for (int i = 0; i < 16; ++i) challenge[i] = uint8_t(i);
+        {
+                Fixture f("hunter2");
+                f.config.vencrypt = true;
+                Session s(f.config, f.handler);
+                CHECK(f.feed(s, text("RFB 003.008\n")) == std::vector<uint8_t>({1, 19}));
+                CHECK(f.feed(s, {19}) == std::vector<uint8_t>({0, 2}));               // VeNCrypt 0.2
+                CHECK(f.feed(s, {0, 2}) == std::vector<uint8_t>({0, 1, 0, 0, 1, 5})); // ok; X509Vnc (261)
+                CHECK(f.feed(s, {0, 0, 1, 5}) == std::vector<uint8_t>({1}));          // accepted
+                CHECK(s.state() == Session::State::Tls);
+                // Nothing is taken until TLS is up (the viewer's ClientHello is TLS's).
+                std::vector<uint8_t> out(64);
+                Writer               w(out.data(), out.size());
+                const uint8_t        hello[] = {0x16, 3, 1};
+                CHECK(s.feed(hello, sizeof(hello), w) == 0);
+                CHECK(w.size() == 0);
+                CHECK(s.state() == Session::State::Tls);
+                s.tlsStarted(w);
+                CHECK(std::vector<uint8_t>(out.begin(), out.begin() + long(w.size())) ==
+                      std::vector<uint8_t>(challenge, challenge + 16));
+                vnc::vncResponse("hunter2", challenge, response);
+                CHECK(f.feed(s, std::vector<uint8_t>(response, response + 16)) == std::vector<uint8_t>({0, 0, 0, 0}));
+                checkServerInit(f.feed(s, {0}));
+        }
+        {
+                // Plain VNC authentication refused; another subtype refused.
+                Fixture f("hunter2");
+                f.config.vencrypt = true;
+                Session s(f.config, f.handler);
+                f.feed(s, text("RFB 003.008\n"));
+                f.feed(s, {2});
+                CHECK(s.isClosed());
+                Session t(f.config, f.handler);
+                f.feed(t, text("RFB 003.008\n"));
+                f.feed(t, {19});
+                f.feed(t, {0, 2});
+                CHECK(f.feed(t, {0, 0, 1, 4}) == std::vector<uint8_t>({0}));
+                CHECK(t.isClosed());
+        }
+        {
+                // 3.3 can't choose: refused with a reason.
+                Fixture f("hunter2");
+                f.config.vencrypt = true;
+                Session                    s(f.config, f.handler);
+                const std::vector<uint8_t> w = f.feed(s, text("RFB 003.003\n"));
+                REQUIRE(w.size() > 8);
+                CHECK(vnc::readU32(&w[0]) == 0);
+                CHECK(s.isClosed());
+        }
+}
+
 TEST_CASE("RFB 3.3 and 3.7: the server chooses, and the results' differences") {
         {
                 Fixture f;
@@ -313,4 +367,22 @@ TEST_CASE("Keysyms: characters, Shift where the viewer didn't send it, modifiers
         CHECK(vnc::mapKeysym(0x00e9).usage == 0);    // é: no US key
         CHECK(vnc::mapKeysym('~').shift);
         CHECK(k.event(true, 0x20ac).usage == 0); // €: nothing injected
+}
+
+TEST_CASE("Cut text: Latin-1 and UTF-8 both ways") {
+        using vnc::Text::latin1FromUtf8;
+        using vnc::Text::utf8FromLatin1;
+        char out[64];
+        // Latin-1 in: é (0xe9) and ÿ (0xff) as two bytes each; CR LF as LF.
+        const char latin[] = "caf\xe9\r\n\xff!";
+        size_t     n = utf8FromLatin1(latin, sizeof(latin) - 1, out, sizeof(out));
+        CHECK(std::string(out, n) == "caf\xc3\xa9\n\xc3\xbf!");
+        // Room for half a character: stops before it.
+        CHECK(utf8FromLatin1("\xe9", 1, out, 1) == 0);
+        // UTF-8 out: Latin-1's own, '?' for the rest (the euro sign, an emoji), a broken sequence.
+        const char utf8[] = "caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80 \xc3";
+        n = latin1FromUtf8(utf8, sizeof(utf8) - 1, out, sizeof(out));
+        CHECK(std::string(out, n) == "caf\xe9 ? ? ?");
+        // Overlong forms aren't Latin-1's characters.
+        CHECK(std::string(out, latin1FromUtf8("\xc1\x81", 2, out, sizeof(out))) == "?");
 }

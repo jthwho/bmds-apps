@@ -23,10 +23,15 @@ ap.add_argument('--compress', type=int, default=-1, help='CompressLevel 0-9 (non
 ap.add_argument('--out', default='vnc.png')
 ap.add_argument('--password')
 ap.add_argument('--type')
+ap.add_argument('--wiggle', action='store_true', help='with --seconds: a pointer move before each update')
+ap.add_argument('--point', help='X,Y: move the pointer there after the first update (no click)')
+ap.add_argument('--type-delay', type=float, default=0, help='seconds of updates before typing')
 ap.add_argument('--updates', type=int, default=1)
 ap.add_argument('--bpp16', action='store_true')
 ap.add_argument('--skip', action='store_true', help='parse updates without decoding them (speed tests)')
 ap.add_argument('--seconds', type=float, default=0, help='then ask for updates this long and report the rate')
+ap.add_argument('--cut', help='text to copy (ClientCutText, Latin-1) after the first update')
+ap.add_argument('--watch-cut', type=float, default=0, help='then print the server\'s cut texts this long')
 a = ap.parse_args()
 
 s = socket.create_connection((a.host, a.port), timeout=30)
@@ -43,15 +48,35 @@ def u8(): return rx(1)[0]
 def u16(): return struct.unpack('>H', rx(2))[0]
 def u32(): return struct.unpack('>I', rx(4))[0]
 
-ver = rx(12); s.sendall(b'RFB 003.008\n')
-types = rx(u8())
-if 2 in types:
-    s.sendall(b'\x02'); ch = rx(16)
+def vnc_auth():
+    ch = rx(16)
     key = bytes(int('{:08b}'.format(c)[::-1], 2) for c in (a.password or '').encode()[:8].ljust(8, b'\0'))
     from subprocess import run
     resp = run(['openssl', 'enc', '-des-ecb', '-provider', 'legacy', '-provider', 'default', '-K', key.hex(), '-nopad'],
                input=ch, capture_output=True).stdout
     s.sendall(resp)
+
+ver = rx(12); s.sendall(b'RFB 003.008\n')
+types = rx(u8())
+if 19 in types:
+    # VeNCrypt 0.2, X509Vnc (261): TLS (the server's certificate shown, not checked), then VNC's.
+    import ssl, hashlib
+    s.sendall(b'\x13'); vv = rx(2)
+    if vv != b'\x00\x02': raise SystemExit('VeNCrypt %r?' % vv)
+    s.sendall(b'\x00\x02')
+    if u8() != 0: raise SystemExit('VeNCrypt version refused')
+    subtypes = [u32() for _ in range(u8())]
+    if 261 not in subtypes: raise SystemExit('VeNCrypt subtypes %r' % subtypes)
+    s.sendall(struct.pack('>I', 261))
+    if u8() != 1: raise SystemExit('X509Vnc refused')
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+    t0 = time.time(); s = ctx.wrap_socket(s); dt = time.time() - t0
+    der = s.getpeercert(binary_form=True)
+    print('tls: %s %s in %.2f s, the server\'s certificate sha256 %s' % (s.version(), s.cipher()[0], dt,
+          ':'.join('%02X' % b for b in hashlib.sha256(der).digest())), flush=True)
+    vnc_auth()
+elif 2 in types:
+    s.sendall(b'\x02'); vnc_auth()
 else:
     s.sendall(b'\x01')
 res = u32()
@@ -171,12 +196,22 @@ def update(incremental):
                 got += 1
             return time.time() - t0
         elif t == 2: pass
-        elif t == 3: rx(3); rx(u32())
+        elif t == 3:
+            rx(3); text = rx(u32()).decode('latin-1')
+            print('cut text from the server: %r' % text, flush=True)
         else: raise SystemExit('message %d?' % t)
 
 dt = update(0)
 print('full update in %.2f s, rects by encoding %s' % (dt, stats))
+if a.cut is not None:
+    data = a.cut.encode('latin-1')
+    s.sendall(struct.pack('>BxxxI', 6, len(data)) + data)
+if a.point:
+    px, py = (int(v) for v in a.point.split(','))
+    s.sendall(struct.pack('>BBHH', 5, 0, px, py)); time.sleep(0.5)
 if a.type:
+    end = time.time() + a.type_delay
+    while time.time() < end: update(1)
     keys = [ord(ch) for ch in a.type] + [0xff0d]
     for k in keys: s.sendall(struct.pack('>BBxxI', 4, 1, k) + struct.pack('>BBxxI', 4, 0, k))
     s.sendall(struct.pack('>BBHH', 5, 0, W // 2, H // 2) + struct.pack('>BBHH', 5, 1, W//2, H//2) + struct.pack('>BBHH', 5, 0, W//2, H//2))
@@ -186,8 +221,16 @@ for i in range(a.updates - 1):
 if a.seconds > 0:
     received[0] = 0; n = 0; t0 = time.time()
     while time.time() - t0 < a.seconds:
+        if a.wiggle: s.sendall(struct.pack('>BBHH', 5, 0, 200 + n % 800, 200 + (n * 7) % 400))
         update(1); n += 1
     dt = time.time() - t0
     print('%d updates in %.1f s: %.1f a second, %.2f MB/s' % (n, dt, n / dt, received[0] / dt / 1e6))
+if a.watch_cut > 0:
+    end = time.time() + a.watch_cut
+    s.settimeout(0.5)
+    while time.time() < end:
+        try: update(1)
+        except socket.timeout: pass
+    s.settimeout(None)
 if not a.skip: fb.save(a.out)
 s.close()

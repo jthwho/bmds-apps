@@ -46,12 +46,16 @@ namespace {
                 {"vnc/port", BMDS_SYSCONF_TYPE_INT, "5900", "The VNC server's TCP port", nullptr, 1, 65535},
                 {"vnc/listen", BMDS_SYSCONF_TYPE_ENUM, "loopback",
                  "Where the VNC server listens: loopback (reach it through an SSH tunnel) or lan (every "
-                 "interface, only with a password; not encrypted: the password can be guessed from the traffic)",
+                 "interface, only with a password; encrypted as vnc/encryption says)",
                  "loopback|lan", 0, 0},
                 {"vnc/jpeg-quality", BMDS_SYSCONF_TYPE_INT, "80", "The VNC server's JPEG quality at most (1-100)",
                  nullptr, 1, 100},
                 {"vnc/start-wait", BMDS_SYSCONF_TYPE_INT, "30",
                  "Seconds the VNC server waits for the desktop when started early (autoexec.sh)", nullptr, 0, 600},
+                {"vnc/encryption", BMDS_SYSCONF_TYPE_ENUM, "tls",
+                 "On the LAN: tls (VeNCrypt with the board's certificate; TigerVNC, TurboVNC, Remmina) or none (the "
+                 "password alone, for viewers without VeNCrypt: it can be guessed from the traffic)",
+                 "tls|none", 0, 0},
         };
 
         // A declared setting's value into @p out (its default if it can't be read).
@@ -248,6 +252,8 @@ int main(int argc, char **argv) {
         s.jpegCeiling = atoi(value);
         setting(Params[3], value, sizeof(value));
         s.startWaitS = atoi(value);
+        setting(Params[4], value, sizeof(value));
+        s.tls = s.lan && strcmp(value, "none") != 0;
         (void)readPassword(s.password, sizeof(s.password));
         s.verbose = verbose;
         if (s.lan && s.password[0] == '\0') {

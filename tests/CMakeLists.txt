@@ -37,7 +37,7 @@ add_test(NAME irc COMMAND irc_test)
 find_package(ZLIB REQUIRED)
 set(VNC_CORE ${CMAKE_CURRENT_LIST_DIR}/../vnc/core)
 set(VNC_CORE_SRCS ${VNC_CORE}/des.cpp ${VNC_CORE}/encode.cpp ${VNC_CORE}/keysym.cpp ${VNC_CORE}/pixelformat.cpp
-                  ${VNC_CORE}/rfb.cpp)
+                  ${VNC_CORE}/rfb.cpp ${VNC_CORE}/text.cpp)
 add_library(vnc_core STATIC ${VNC_CORE_SRCS})
 target_include_directories(vnc_core PUBLIC ${VNC_CORE})
 target_compile_options(vnc_core PRIVATE -fno-exceptions -fno-rtti)

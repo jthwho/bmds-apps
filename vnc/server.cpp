@@ -12,10 +12,13 @@
 
 #include "server.h"
 
+#include "core/text.h"
+
 #include <bmds/guiclasses.h>
 #include <bmds/sys.h>
 
 #include <arpa/inet.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,10 +41,10 @@ namespace vnc {
         namespace {
 
                 constexpr size_t InBytes = 16 * 1024;
-                // A viewer's memory (devplan/vnc.md §18): about 1 MB in all with the encoder's, so a game
-                // and a viewer fit together. Bigger changes go in more updates.
+                // Memory (devplan/vnc.md §18, §21): a viewer's update buffer and encoder, about 650 KB;
+                // one capture buffer for all, as much as one update always carries (no leftovers).
                 constexpr size_t      OutBytes = 384 * 1024;     // an update at most (a 2048-wide band's worst case)
-                constexpr size_t      CaptureBytes = 768 * 1024; // a capture's pixels (a 2048-wide tile row at least)
+                constexpr size_t      CaptureBytes = 256 * 1024; // a capture's pixels (a 2048-wide tile row at least)
                 constexpr uint32_t    MaxRects = 64;
                 constexpr uint16_t    BandRows = 16;            // a rectangle is encoded in bands of these
                 constexpr uint32_t    MaxRectsAnUpdate = 60000; // under the header's 16 bits
@@ -49,6 +52,8 @@ namespace vnc {
                 constexpr uint64_t    FailureWindowMs = 60'000; // within this long
                 constexpr uint64_t    RefusedMs = 60'000;       // then refused for this long
                 constexpr const char *TrayIconName = "preferences-system-network";
+                constexpr const char *LogPath = "/tmp/vncserver.log"; // beside the pid file; RAM: kept small
+                constexpr long        LogBytes = 32 * 1024;           // started afresh past this
 
                 volatile sig_atomic_t stopAsked = 0;
 
@@ -77,25 +82,32 @@ namespace vnc {
         } // namespace
 
         struct Server::Viewer {
-                        Viewer(const Session::Config &config, Handler &handler) : session(config, handler) {}
+                        Viewer(Server &server, const Session::Config &config)
+                            : events(server, this), session(config, events) {}
 
+                        Events   events; // before the session: it calls them
                         int      fd = -1;
                         uint32_t address = 0; // IPv4, network order
-                        char     name[32] = {};
+                        char     name[40] = {}; // "Viewer N (ADDRESS)", as the user sees it
                         uint64_t sinceMs = 0;
                         Session  session;
                         Encoder  encoder;
                         KeyState keys;
-                        uint8_t  buttons = 0; // RFB's, as last sent
-                        bool     watching = false;
+                        uint8_t  buttons = 0;       // RFB's, as last sent
+                        uint32_t screen = 0;        // its ScreenShare: its own changes (its watch)
+                        uint32_t notification = 0;  // "Viewer connected", with Disconnect
+                        bool     watching = false;  // authenticated and watching
                         bool     requested = false; // an update asked for and not sent
                         bool     full = false;      // the whole screen asked for
-                        bool     changed = false;   // the screen changed since the last capture
-                        bool     more = false;      // the last capture left changes behind
+                        bool     changed = false;   // the screen changed since its last capture
+                        bool     more = false;      // its last capture left changes behind
+                        bool     cutPending = false; // the board's copy to send it
+                        unsigned refused = 0;        // injections the system refused (the first few logged)
                         // The viewer's SetPixelFormat and SetEncodings while the worker encodes: kept,
                         // and given to the encoder before the next job.
                         bool        pendingFormat = false;
                         PixelFormat format;
+                        size_t      bytesPerPixel = 4; // its format's, as the encoder has it
                         bool        pendingEncodings = false;
                         int32_t     encodings[64];
                         size_t      encodingCount = 0;
@@ -104,7 +116,7 @@ namespace vnc {
                         uint8_t    *out = nullptr;
                         size_t      outSize = 0;
                         size_t      outSent = 0;
-                        uint8_t    *pixels = nullptr; // the last capture's rectangles, packed
+                        // Its last capture's rectangles (their pixels in the shared buffer while it owns it).
                         bmds_rect_t rects[MaxRects];
                         size_t      offsets[MaxRects];
                         uint32_t    rectCount = 0;
@@ -112,22 +124,55 @@ namespace vnc {
                         uint16_t    bandAt = 0; // and its next row
                         uint16_t    capturedWidth = 0;
                         uint16_t    capturedHeight = 0;
+                        uint16_t    width = 0; // the picture it has (DesktopSize when it changes)
+                        uint16_t    height = 0;
+                        // -v: its encoder's totals at its last update.
+                        uint64_t zlibSeen = 0;
+                        uint64_t encodeSeen = 0;
+                        uint64_t pixelsSeen = 0;
 
                         // A writer appending to what is still to be sent.
                         Writer appender() { return Writer(out + outSize, OutBytes - outSize); }
+                        bool   isFlushed() const { return outSent >= outSize; }
+                        bool   hasLeftover() const { return rectAt < rectCount; }
         };
 
         Server::Server(const Settings &settings) : _settings(settings) {}
 
         Server::~Server() {
-                if (_viewer != nullptr) drop("the server stopped");
+                while (_viewerCount > 0) drop(_viewers[_viewerCount - 1], "the server stopped");
                 stopWorker();
+                free(_cut);
+                free(_pixels);
                 const int pipes[] = {_jobPipe[0], _jobPipe[1], _donePipe[0], _donePipe[1]};
                 for (int fd : pipes)
                         if (fd >= 0) close(fd);
                 if (_listen >= 0) close(_listen);
                 if (_outputWatch >= 0) close(_outputWatch);
                 if (_gui != nullptr) bmds_gui_close(_gui);
+                if (_log != nullptr) fclose(_log);
+        }
+
+        void Server::event(const char *format, ...) {
+                char    text[200];
+                va_list ap;
+                va_start(ap, format);
+                vsnprintf(text, sizeof(text), format, ap);
+                va_end(ap);
+                if (_settings.verbose) fprintf(stderr, "%s\n", text);
+                if (_log == nullptr) return;
+                if (ftell(_log) > LogBytes) {
+                        fclose(_log);
+                        _log = fopen(LogPath, "w");
+                        if (_log == nullptr) return;
+                }
+                time_t    now = time(nullptr);
+                struct tm t;
+                localtime_r(&now, &t);
+                fprintf(_log, "%04d-%02d-%02d %02d:%02d:%02d %s\n", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                        t.tm_hour, t.tm_min, t.tm_sec, text);
+                fflush(_log);
+                return;
         }
 
         // ---- Starting
@@ -172,6 +217,7 @@ namespace vnc {
                                 fprintf(ok ? stdout : stderr, "vncserver: %s\n", text);
                         }
                 };
+                _log = fopen(LogPath, "a");
                 struct sigaction sa = {};
                 sa.sa_handler = onTerm;
                 (void)sigaction(SIGTERM, &sa, nullptr);
@@ -197,7 +243,16 @@ namespace vnc {
                         say(false, why);
                         return 1;
                 }
-                _screen = bmds_screen_share_new(_gui, 0);
+                _inputShare = bmds_screen_share_new(_gui, 0); // the viewers' input goes through it
+                // One capture buffer for all viewers, on BMDS_CAPTURE_ALIGN: the kernel's 2D-DMA fills it.
+                void *pixels = nullptr;
+                if (posix_memalign(&pixels, BMDS_CAPTURE_ALIGN, CaptureBytes) != 0) {
+                        say(false, "out of memory");
+                        return 1;
+                }
+                _pixels = static_cast<uint8_t *>(pixels);
+                _clipboard = bmds_clipboard_new(_gui, 0); // 0: no clipboard sharing, the rest works
+                _cut = static_cast<char *>(malloc(Session::MaxCutText));
                 // The cores' load counters (place()), and the worker on the less busy core now.
                 bmds_counter_t info;
                 for (uint32_t i = 0;; ++i) {
@@ -222,37 +277,28 @@ namespace vnc {
                 _tray = bmds_tray_icon_new(_gui, 0);
                 bmds_tray_icon_set_icon(_gui, _tray, TrayIconName);
                 bmds_tray_icon_set_category(_gui, _tray, "application");
-                _trayMenu = bmds_menu_new(_gui, _tray); // a tray icon's menu: its context menu
-                _menuViewer = bmds_menu_item_new(_gui, _trayMenu);
-                bmds_menu_item_set_enabled(_gui, _menuViewer, 0);
-                _menuDisconnect = bmds_menu_item_new(_gui, _trayMenu);
-                bmds_menu_item_set_text(_gui, _menuDisconnect, "&Disconnect");
                 // The display blanked while a viewer is in: display/output = remote, the system's own
                 // (devplan/vnc.md §14), so one setting says it however it is changed.
                 _outputId = bmds_sysconf_find("display/output");
-                if (_outputId >= 0) {
-                        bmds_menu_add_separator(_gui, _trayMenu);
-                        _menuBlank = bmds_menu_item_new(_gui, _trayMenu);
-                        bmds_menu_item_set_text(_gui, _menuBlank, "&Blank Display While Connected");
-                        _outputWatch = int(bmds_sysconf_watch("display/output", BMDS_O_CLOEXEC));
-                        readBlank();
-                }
-                bmds_menu_add_separator(_gui, _trayMenu);
-                _menuStop = bmds_menu_item_new(_gui, _trayMenu);
-                bmds_menu_item_set_text(_gui, _menuStop, "&Stop Server");
+                if (_outputId >= 0) _outputWatch = int(bmds_sysconf_watch("display/output", BMDS_O_CLOEXEC));
                 refreshTray();
                 bmds_tray_icon_set_visible(_gui, _tray, 1);
                 char body[128];
-                if (_settings.lan) {
+                if (_settings.tls) {
+                        snprintf(body, sizeof(body),
+                                 "Listening on %s with TLS (VeNCrypt): 'tls cert' shows the certificate viewers see",
+                                 _address);
+                        notify("VNC server started", body, "low", nullptr);
+                } else if (_settings.lan) {
                         // On the network without TLS: said where it can't be missed.
                         snprintf(body, sizeof(body),
                                  "Listening on %s, not encrypted: anyone on the network can watch the session",
                                  _address);
-                        notify("VNC server started", body, "normal", false);
+                        notify("VNC server started", body, "normal", nullptr);
                 } else {
                         snprintf(body, sizeof(body), "Listening on %s%s", _address,
                                  _settings.password[0] != '\0' ? "" : " (no password)");
-                        notify("VNC server started", body, "low", false);
+                        notify("VNC server started", body, "low", nullptr);
                 }
                 (void)bmds_gui_flush(_gui);
                 say(true, body);
@@ -265,26 +311,30 @@ namespace vnc {
                 while (!_stopping && !stopAsked) {
                         // Events the library holds already first: poll wouldn't see them.
                         guiEvents();
-                        if (_viewer != nullptr) place();
+                        if (_viewerCount > 0) place();
+                        for (size_t i = 0; i < _viewerCount; ++i) startTls(_viewers[i]);
+                        for (size_t i = 0; i < _viewerCount; ++i) flushCut(_viewers[i]);
                         startUpdate();
                         (void)bmds_gui_flush(_gui);
-                        // The GUI, the listener, display/output's watch (if any), the viewer (if any).
-                        pollfd fds[5];
-                        nfds_t n = 0;
+                        // The GUI, the listener, the worker's answers, display/output's watch, the viewers.
+                        pollfd  fds[4 + MaxViewers];
+                        Viewer *polled[MaxViewers] = {};
+                        nfds_t  n = 0;
                         fds[n++] = pollfd{bmds_gui_fd(_gui), POLLIN, 0};
                         fds[n++] = pollfd{_listen, POLLIN, 0};
                         const nfds_t doneAt = _donePipe[0] >= 0 ? n : nfds_t(-1);
                         if (_donePipe[0] >= 0) fds[n++] = pollfd{_donePipe[0], POLLIN, 0};
                         const nfds_t watchAt = _outputWatch >= 0 ? n : nfds_t(-1);
                         if (_outputWatch >= 0) fds[n++] = pollfd{_outputWatch, POLLIN, 0};
-                        const nfds_t viewerAt = _viewer != nullptr ? n : nfds_t(-1);
-                        if (_viewer != nullptr) {
-                                short want = POLLIN;
-                                if (_viewer->outSent < _viewer->outSize) want = short(want | POLLOUT);
-                                fds[n++] = pollfd{_viewer->fd, want, 0};
+                        const nfds_t viewersAt = n;
+                        const size_t viewers = _viewerCount;
+                        for (size_t i = 0; i < viewers; ++i) {
+                                Viewer *v = _viewers[i];
+                                polled[i] = v;
+                                fds[n++] = pollfd{v->fd, short(v->isFlushed() ? POLLIN : POLLIN | POLLOUT), 0};
                         }
                         // With a viewer in, a look at the cores now and then (place()).
-                        const int r = poll(fds, n, _viewer != nullptr ? 1000 : -1);
+                        const int r = poll(fds, n, viewers > 0 ? 1000 : -1);
                         if (_settings.verbose)
                                 fprintf(stderr, "poll %d: gui %x listen %x\n", r, fds[0].revents, fds[1].revents);
                         if (r < 0) {
@@ -302,10 +352,11 @@ namespace vnc {
                                 (void)read(_outputWatch, records, sizeof(records)); // only one is watched
                                 readBlank();
                         }
-                        if (viewerAt != nfds_t(-1) && _viewer != nullptr) {
-                                const short got = fds[viewerAt].revents;
-                                if (got & (POLLIN | POLLHUP | POLLERR)) readViewer();
-                                if (_viewer != nullptr && (got & POLLOUT)) (void)writeViewer();
+                        for (size_t i = 0; i < viewers; ++i) {
+                                Viewer     *v = polled[i];
+                                const short got = fds[viewersAt + i].revents;
+                                if (isAlive(v) && (got & (POLLIN | POLLHUP | POLLERR))) readViewer(v);
+                                if (isAlive(v) && (got & POLLOUT)) (void)writeViewer(v);
                         }
                 }
                 return 0;
@@ -319,25 +370,90 @@ namespace vnc {
                                 const char *name = bmds_gui_atom_name(_gui, e.name);
                                 fprintf(stderr, "event %s from %u\n", name != nullptr ? name : "?", unsigned(e.source));
                         }
-                        if (e.source == _screen && bmds_gui_event_is(_gui, &e, BMDS_GUI_SCREEN_SHARE_CHANGED)) {
-                                if (_viewer != nullptr) _viewer->changed = true;
-                        } else if (e.source == _menuDisconnect && _viewer != nullptr) {
-                                drop("disconnected at the board");
-                        } else if (e.source == _menuStop) {
+                        if (e.source == 0) continue;
+                        if (e.source == _clipboard) {
+                                clipboardEvent(e);
+                                continue;
+                        }
+                        if (e.source == _menuStop) {
                                 _stopping = true;
-                        } else if (e.source == _menuBlank && _menuBlank != 0) {
+                                continue;
+                        }
+                        if (e.source == _menuBlank) {
                                 toggleBlank();
-                        } else if (e.source == _notification && _notification != 0 &&
-                                   bmds_gui_event_is(_gui, &e, BMDS_GUI_NOTIFICATION_ACTIVATED) && e.count == 1 &&
-                                   e.values[0].number == 0 && _viewer != nullptr) {
-                                drop("disconnected at the board");
+                                continue;
+                        }
+                        if (e.source == _menuDisconnect) {
+                                while (_viewerCount > 0) drop(_viewers[_viewerCount - 1], "disconnected at the board");
+                                continue;
+                        }
+                        if (e.source == _menuInputNone) {
+                                giveInput(nullptr, true);
+                                continue;
+                        }
+                        for (size_t i = 0; i < MaxViewers; ++i)
+                                if (e.source == _menuInputTo[i] && i < _viewerCount) giveInput(_viewers[i], true);
+                        for (size_t i = 0; i < _viewerCount; ++i) {
+                                Viewer *v = _viewers[i];
+                                if (e.source == v->screen &&
+                                    bmds_gui_event_is(_gui, &e, BMDS_GUI_SCREEN_SHARE_CHANGED)) {
+                                        v->changed = true;
+                                } else if (e.source == v->notification &&
+                                           bmds_gui_event_is(_gui, &e, BMDS_GUI_NOTIFICATION_ACTIVATED) &&
+                                           e.count == 1 && e.values[0].number == 0) {
+                                        drop(v, "disconnected at the board");
+                                        break;
+                                }
                         }
                 }
                 if (r < 0) _stopping = true; // the GUI service closed the connection
                 return;
         }
 
-        // ---- Viewers
+        // ---- The clipboard (devplan/vnc.md §19): RFB's cut text, Latin-1, the clipboard selection
+
+        void Server::clipboardEvent(const bmds_gui_event_t &e) {
+                if (bmds_gui_event_is(_gui, &e, BMDS_GUI_CLIPBOARD_CHANGED)) {
+                        // Someone copied on the board (not our own copy of a viewer's): read it.
+                        const char *which =
+                                e.count == 1 ? bmds_gui_atom_name(_gui, uint32_t(e.values[0].number)) : nullptr;
+                        if (_viewerCount == 0 || which == nullptr || strcmp(which, "clipboard") != 0) return;
+                        bmds_gui_value_t owns = {};
+                        if (bmds_clipboard_owns(_gui, _clipboard, "clipboard", &owns) == 0 && owns.number != 0) return;
+                        (void)bmds_clipboard_paste(_gui, _clipboard, "clipboard", "text/plain;charset=utf-8");
+                } else if (bmds_gui_event_is(_gui, &e, BMDS_GUI_CLIPBOARD_PASTED) && e.count == 3 && _cut != nullptr) {
+                        const bmds_gui_value_t &bytes = e.values[2];
+                        _cutSize = vnc::Text::latin1FromUtf8(bytes.text, bytes.length, _cut, Session::MaxCutText);
+                        if (_settings.verbose)
+                                fprintf(stderr, "clipboard: %u bytes to the viewers\n", unsigned(_cutSize));
+                        // To every viewer (output, as the screen is), each between its updates.
+                        for (size_t i = 0; i < _viewerCount; ++i) {
+                                _viewers[i]->cutPending = _cutSize > 0;
+                                flushCut(_viewers[i]);
+                        }
+                }
+                return;
+        }
+
+        void Server::flushCut(Viewer *v) {
+                if (!v->cutPending || (_busy && v == _jobViewer) || v->session.state() != Session::State::Normal)
+                        return;
+                if (OutBytes - v->outSize < _cutSize + 8) return; // after what is being sent
+                Writer w = v->appender();
+                Session::writeCutText(w, _cut, _cutSize);
+                v->outSize += w.size();
+                v->cutPending = false;
+                (void)writeViewer(v);
+                return;
+        }
+
+        // ---- Viewers (devplan/vnc.md §21: several, one with the input)
+
+        bool Server::isAlive(const Viewer *v) const {
+                for (size_t i = 0; i < _viewerCount; ++i)
+                        if (_viewers[i] == v) return true;
+                return false;
+        }
 
         void Server::accept() {
                 sockaddr_in from = {};
@@ -347,8 +463,8 @@ namespace vnc {
                 if (_settings.verbose) fprintf(stderr, "accept: %d (%s)\n", fd, fd < 0 ? strerror(errno) : "ok");
                 if (fd < 0) return;
                 const uint32_t address = from.sin_addr.s_addr;
-                if (_viewer != nullptr || isRefused(address)) {
-                        close(fd); // one viewer at a time (devplan/vnc.md A6); a guesser waits
+                if (_viewerCount == MaxViewers || isRefused(address)) {
+                        close(fd); // as many as BMDS's watches; a guesser waits
                         return;
                 }
                 const int on = 1;
@@ -358,21 +474,18 @@ namespace vnc {
                 c.width = _width;
                 c.height = _height;
                 c.password = _settings.password[0] != '\0' ? _settings.password : nullptr;
+                c.vencrypt = _settings.tls;
+                c.maxCutText = InBytes - 8; // a longer copy can't be held whole: skipped
                 c.random = random;
                 c.randomArg = this;
-                auto *v = new (std::nothrow) Viewer(c, _events);
+                auto *v = new (std::nothrow) Viewer(*this, c);
                 if (v == nullptr) {
                         close(fd);
                         return;
                 }
                 v->out = static_cast<uint8_t *>(malloc(OutBytes));
-                // On BMDS_CAPTURE_ALIGN: the kernel copies a capture by the 2D-DMA into it.
-                void *pixels = nullptr;
-                if (posix_memalign(&pixels, BMDS_CAPTURE_ALIGN, CaptureBytes) == 0)
-                        v->pixels = static_cast<uint8_t *>(pixels);
-                if (v->out == nullptr || v->pixels == nullptr || !v->encoder.init(Encoder::TightMaxPixels)) {
+                if (v->out == nullptr || !v->encoder.init(Encoder::TightMaxPixels)) {
                         free(v->out);
-                        free(v->pixels);
                         delete v;
                         close(fd);
                         return;
@@ -380,78 +493,146 @@ namespace vnc {
                 v->fd = fd;
                 v->address = address;
                 v->sinceMs = nowMs();
-                inet_ntop(AF_INET, &from.sin_addr, v->name, sizeof(v->name));
+                v->width = _width;
+                v->height = _height;
+                char ip[INET_ADDRSTRLEN] = {};
+                inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+                snprintf(v->name, sizeof(v->name), "Viewer %u (%s)", unsigned(++_viewersSeen), ip);
                 v->encoder.setJpeg(jpeg, this);
                 v->encoder.setJpegCeiling(_settings.jpegCeiling);
-                _viewer = v;
-                _timing = Timing(); // its encoder's totals start at 0
+                _viewers[_viewerCount++] = v;
+                event("%s: connected (%u in)", v->name, unsigned(_viewerCount));
                 Writer w = v->appender();
                 v->session.start(w);
                 v->outSize += w.size();
-                (void)writeViewer();
+                (void)writeViewer(v);
                 return;
         }
 
-        void Server::drop(const char *why) {
-                Viewer *v = _viewer;
-                if (v == nullptr) return;
-                if (_busy) {
-                        // The worker is using it: its answer waited for first.
+        void Server::drop(Viewer *v, const char *why) {
+                if (!isAlive(v)) return;
+                event("%s: dropped: %s%s", v->name, why, v == _input ? " (it had the input)" : "");
+                if (_busy && _jobViewer == v) {
+                        // The worker is using it: its answer waited for first (and left unused).
                         char result = 0;
                         while (read(_donePipe[0], &result, 1) < 0 && errno == EINTR) continue;
                         _busy = false;
+                        _jobViewer = nullptr;
                 }
-                _viewer = nullptr;
-                if (v->watching) bmds_screen_share_watch(_gui, _screen, 0); // the tray's mark goes too
+                size_t at = 0;
+                while (_viewers[at] != v) ++at;
+                for (size_t i = at; i + 1 < _viewerCount; ++i) _viewers[i] = _viewers[i + 1]; // the order kept
+                _viewers[--_viewerCount] = nullptr;
+                if (_pixelsOwner == v) _pixelsOwner = nullptr;
+                // Its ScreenShare destroyed: its watch ends, and the tray's mark with the last one.
+                if (v->screen != 0) bmds_gui_destroy(_gui, v->screen);
                 if (v->session.failedAuthentication()) {
                         failedFrom(v->address);
                 } else if (v->watching) {
                         char body[96];
                         snprintf(body, sizeof(body), "%s: %s", v->name, why);
-                        notify("Viewer left", body, "low", false);
+                        notify("Viewer left", body, "low", nullptr);
                 }
+                if (_input == v) {
+                        // The next in the order they came, watching already (devplan/vnc.md §21).
+                        Viewer *next = nullptr;
+                        for (size_t i = 0; i < _viewerCount && next == nullptr; ++i)
+                                if (_viewers[i]->watching) next = _viewers[i];
+                        giveInput(next, false); // its keys and buttons let go first
+                }
+                if (_viewerCount == 0) _inputNone = false; // the next first viewer gets it again
                 close(v->fd);
                 free(v->out);
-                free(v->pixels);
                 delete v;
                 refreshTray();
                 return;
         }
 
-        void Server::readViewer() {
-                Viewer       *v = _viewer;
-                const ssize_t n = recv(v->fd, v->in + v->inSize, InBytes - v->inSize, 0);
-                if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
-                        drop(n == 0 ? "the viewer closed" : "the connection failed");
+        // @p v has the keys and the pointer (null: nobody; @p chosen: the tray's None, kept until
+        // all have left). Injected keys and buttons are let go first: the ScreenShare that injected
+        // them is made again (BMDS releases what an object pressed when it goes).
+        void Server::giveInput(Viewer *v, bool chosen) {
+                if (v == _input) {
+                        _inputNone = v == nullptr && (chosen || _inputNone);
+                        refreshTray();
                         return;
                 }
-                if (_settings.verbose) fprintf(stderr, "recv: %d\n", int(n));
+                if (_input != nullptr) {
+                        _input->keys = KeyState();
+                        _input->buttons = 0;
+                        bmds_gui_destroy(_gui, _inputShare);
+                        _inputShare = bmds_screen_share_new(_gui, 0);
+                }
+                _input = v;
+                _inputNone = v == nullptr && chosen;
+                event("input: %s%s", v != nullptr ? v->name : "nobody", chosen ? " (the tray's choice)" : "");
+                if (v != nullptr && _viewerCount > 1) {
+                        char body[96];
+                        snprintf(body, sizeof(body), "%s has the keyboard and the mouse", v->name);
+                        notify("VNC input", body, "low", nullptr);
+                }
+                refreshTray();
+                return;
+        }
+
+        void Server::readViewer(Viewer *v) {
+                const ssize_t n = recv(v->fd, v->in + v->inSize, InBytes - v->inSize, 0);
+                if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
+                        drop(v, n == 0 ? "the viewer closed"
+                                : errno == EKEYREJECTED || errno == EPROTO || errno == EBADMSG
+                                        ? "TLS failed"
+                                        : "the connection failed");
+                        return;
+                }
+                if (_settings.verbose) fprintf(stderr, "recv %s: %d\n", v->name, int(n));
                 if (n < 0) return;
                 v->inSize += size_t(n);
                 Writer       w = v->appender();
                 const size_t taken = v->session.feed(v->in, v->inSize, w);
+                if (!isAlive(v)) return; // a session event dropped it
                 v->outSize += w.size();
                 memmove(v->in, v->in + taken, v->inSize - taken);
                 v->inSize -= taken;
-                if (!writeViewer()) return;
+                if (!writeViewer(v)) return;
                 if (v->session.isClosed()) {
-                        drop(v->session.closeReason() != nullptr ? v->session.closeReason() : "closed");
+                        drop(v, v->session.closeReason() != nullptr ? v->session.closeReason() : "closed");
                 } else if (v->inSize == InBytes) {
-                        drop("a message too long"); // nothing was taken from a full buffer
+                        drop(v, "a message too long"); // nothing was taken from a full buffer
                 }
                 return;
         }
 
-        bool Server::writeViewer() {
-                Viewer *v = _viewer;
+        // VeNCrypt (devplan/vnc.md §20): once the subtype's acknowledgement is all sent, the kernel's
+        // TLS on the socket, the server's side with the board's certificate; the challenge follows
+        // inside it. The viewer sends nothing more until it has that byte, so nothing is read in
+        // the clear meanwhile.
+        void Server::startTls(Viewer *v) {
+                if (v->session.state() != Session::State::Tls || !v->isFlushed()) return;
+                bmds_tls_config_t t = {};
+                t.size = sizeof(t);
+                t.flags = BMDS_TLS_SERVER;
+                const int r = bmds_tls_ctl(v->fd, BMDS_TLS_START, &t);
+                event("%s: TLS %s", v->name, r < 0 ? strerror(-r) : "started");
+                if (r < 0) {
+                        drop(v, "TLS couldn't start");
+                        return;
+                }
+                Writer w = v->appender();
+                v->session.tlsStarted(w);
+                v->outSize += w.size();
+                (void)writeViewer(v); // waits for the handshake: POLLOUT once it is done
+                return;
+        }
+
+        bool Server::writeViewer(Viewer *v) {
                 while (v->outSent < v->outSize) {
                         const ssize_t n = send(v->fd, v->out + v->outSent, v->outSize - v->outSent, MSG_NOSIGNAL);
                         if (_settings.verbose)
-                                fprintf(stderr, "send %u: %d %s\n", unsigned(v->outSize - v->outSent), int(n),
-                                        n < 0 ? strerror(errno) : "");
+                                fprintf(stderr, "send %s %u: %d %s\n", v->name, unsigned(v->outSize - v->outSent),
+                                        int(n), n < 0 ? strerror(errno) : "");
                         if (n < 0) {
                                 if (errno == EAGAIN || errno == EINTR) return true;
-                                drop("the connection failed");
+                                drop(v, "the connection failed");
                                 return false;
                         }
                         v->outSent += size_t(n);
@@ -462,16 +643,25 @@ namespace vnc {
 
         // ---- Updates (devplan/vnc.md §5b)
 
-        int Server::capture(bool all) {
-                Viewer               *v = _viewer;
+        // As many pixels as an update always carries in @p v's format (raw, the worst, and a margin
+        // for headers), so a capture never leaves rectangles behind for another viewer to overwrite.
+        size_t Server::captureBytes(const Viewer *v) const {
+                const size_t pixels = (OutBytes - 8192) / (v->bytesPerPixel + 1);
+                size_t       bytes = pixels * 3;
+                if (bytes > CaptureBytes) bytes = CaptureBytes;
+                return bytes & ~size_t(BMDS_CAPTURE_ALIGN - 1);
+        }
+
+        int Server::capture(Viewer *v, bool all) {
                 bmds_screen_capture_t c = {};
                 c.size = sizeof(c);
                 c.format = BMDS_PIXEL_BGR24;
                 c.flags = all ? BMDS_CAPTURE_ALL : 0;
-                c.buffer = v->pixels;
-                c.capacity = CaptureBytes;
+                c.buffer = _pixels;
+                c.capacity = uint32_t(captureBytes(v));
                 c.rects = v->rects;
                 c.max_rects = MaxRects;
+                c.share = v->screen;
                 const int32_t r = bmds_gui_screen_capture(bmds_gui_fd(_gui), &c);
                 if (r == -BMDS_EACCES) return 0; // the watch isn't there yet: its changed will come
                 if (r < 0) return -1;
@@ -500,21 +690,50 @@ namespace vnc {
                 NoFit = -4,
         };
 
-        // On the loop: a job for the worker if an update is asked for, the last one sent and
-        // something is due; the viewer's encoder settings given to the encoder first (it is idle).
+        // On the loop: a job for a viewer that asked for an update, has had its last one, and has
+        // something due, in turns; the viewer's encoder settings given to its encoder first (idle).
+        // The capture buffer's owner with rectangles left goes first; anyone else's capture would
+        // overwrite them (rare: captures fit an update), so then it starts again with everything.
         void Server::startUpdate() {
-                Viewer *v = _viewer;
-                if (v == nullptr || _busy || !_workerRunning || v->session.state() != Session::State::Normal ||
-                    !v->requested || v->outSent < v->outSize)
-                        return;
-                if (v->pendingFormat) v->encoder.setPixelFormat(v->format);
-                if (v->pendingEncodings) v->encoder.setEncodings(v->encodings, v->encodingCount);
-                v->pendingFormat = v->pendingEncodings = false;
-                const bool leftover = v->rectAt < v->rectCount;
-                if (!leftover && !v->full && !v->changed && !v->more) return;
+                if (_busy || !_workerRunning || _viewerCount == 0) return;
+                auto ready = [](Viewer *v) {
+                        return v->session.state() == Session::State::Normal && v->requested && v->isFlushed();
+                };
+                Viewer *pick = nullptr;
+                if (_pixelsOwner != nullptr && _pixelsOwner->hasLeftover() && ready(_pixelsOwner)) pick = _pixelsOwner;
+                for (size_t k = 0; k < _viewerCount && pick == nullptr; ++k) {
+                        Viewer *v = _viewers[(_nextServed + k) % _viewerCount];
+                        if (!ready(v)) continue;
+                        if (v->pendingFormat) {
+                                v->encoder.setPixelFormat(v->format);
+                                v->bytesPerPixel = v->format.bytesPerPixel();
+                        }
+                        if (v->pendingEncodings) v->encoder.setEncodings(v->encodings, v->encodingCount);
+                        v->pendingFormat = v->pendingEncodings = false;
+                        if (v->full || v->changed || v->more || (v == _pixelsOwner && v->hasLeftover())) {
+                                pick = v;
+                                _nextServed = (_nextServed + k + 1) % _viewerCount;
+                        }
+                }
+                if (pick == nullptr) return;
+                if (pick->pendingFormat) {
+                        pick->encoder.setPixelFormat(pick->format);
+                        pick->bytesPerPixel = pick->format.bytesPerPixel();
+                }
+                if (pick->pendingEncodings) pick->encoder.setEncodings(pick->encodings, pick->encodingCount);
+                pick->pendingFormat = pick->pendingEncodings = false;
+                const bool leftover = pick == _pixelsOwner && pick->hasLeftover();
+                if (!leftover && _pixelsOwner != nullptr && _pixelsOwner->hasLeftover()) {
+                        _pixelsOwner->full = true; // its rest is lost with the buffer: everything again
+                        _pixelsOwner->rectAt = _pixelsOwner->rectCount = 0;
+                }
+                _jobViewer = pick;
                 _jobFresh = !leftover;
-                _jobAll = !leftover && v->full;
-                if (_jobFresh) v->changed = false; // a change from here on tells it again
+                _jobAll = !leftover && pick->full;
+                if (_jobFresh) {
+                        pick->changed = false; // a change from here on tells it again
+                        _pixelsOwner = pick;
+                }
                 _busy = true;
                 const char job = 'u';
                 if (write(_jobPipe[1], &job, 1) != 1) _busy = false;
@@ -524,32 +743,32 @@ namespace vnc {
         // On the loop: the worker's answer.
         void Server::updateDone(int result) {
                 _busy = false;
-                Viewer *v = _viewer;
-                if (v == nullptr) return;
+                Viewer *v = _jobViewer;
+                _jobViewer = nullptr;
+                if (v == nullptr || !isAlive(v)) return;
                 switch (result) {
                         case Built:
                                 if (_jobAll) v->full = false;
                                 v->requested = false;
-                                (void)writeViewer();
+                                (void)writeViewer(v);
                                 return;
                         case Nothing:
                                 if (_jobAll) v->full = false;
                                 return;
                         case NotWatched: return; // the request (and a full one) waits for the watch's first change
-                        case CaptureFailed: drop("the screen can't be captured"); return;
-                        case SizeUnfollowable: drop("the screen changed size and the viewer can't follow"); return;
-                        case Broken: drop("an update didn't fit (its stream can't be mended)"); return;
-                        default: drop("an update didn't fit"); return;
+                        case CaptureFailed: drop(v, "the screen can't be captured"); return;
+                        case SizeUnfollowable: drop(v, "the screen changed size and the viewer can't follow"); return;
+                        case Broken: drop(v, "an update didn't fit (its stream can't be mended)"); return;
+                        default: drop(v, "an update didn't fit"); return;
                 }
         }
 
-        // On the worker: the capture (or the last one's rest) encoded into the out buffer.
-        int Server::buildUpdate(bool all, bool fresh) {
+        // On the worker: @p v's capture (or its last one's rest) encoded into its out buffer.
+        int Server::buildUpdate(Viewer *v, bool all, bool fresh) {
                 const uint64_t t0 = nowUs();
-                Viewer        *v = _viewer;
                 if (fresh) {
                         const uint64_t c0 = nowUs();
-                        const int      got = capture(all);
+                        const int      got = capture(v, all);
                         _timing.captureUs += nowUs() - c0;
                         if (got < 0) return CaptureFailed;
                         if (got == 0) return NotWatched;
@@ -559,14 +778,15 @@ namespace vnc {
                 Session::writeUpdateHeader(out, 0);
                 uint32_t count = 0;
                 // The picture's size changed (a program's full screen): the viewer told, or let go.
-                if (v->capturedWidth != _width || v->capturedHeight != _height) {
+                if (v->capturedWidth != v->width || v->capturedHeight != v->height) {
                         if (!v->encoder.hasDesktopSize()) return SizeUnfollowable;
-                        _width = v->capturedWidth;
-                        _height = v->capturedHeight;
-                        v->session.setSize(_width, _height);
-                        Session::writeDesktopSize(out, _width, _height);
+                        v->width = v->capturedWidth;
+                        v->height = v->capturedHeight;
+                        v->session.setSize(v->width, v->height);
+                        Session::writeDesktopSize(out, v->width, v->height);
                         ++count;
                 }
+                const uint8_t *pixels = _pixels;
                 while (v->rectAt < v->rectCount && count < MaxRectsAnUpdate) {
                         const bmds_rect_t &r = v->rects[v->rectAt];
                         const uint16_t     w = uint16_t(r.width), left = uint16_t(r.height - v->bandAt);
@@ -578,8 +798,8 @@ namespace vnc {
                                 if (count > 0) break;                     // the rest in the next update
                                 rows = rows > BandRows ? BandRows : rows; // an empty update: a band anyway
                         }
-                        const Picture picture{v->pixels + v->offsets[v->rectAt] + size_t(v->bandAt) * w * 3,
-                                              size_t(w) * 3, w, rows};
+                        const Picture picture{pixels + v->offsets[v->rectAt] + size_t(v->bandAt) * w * 3, size_t(w) * 3,
+                                              w, rows};
                         const size_t  n = v->encoder.encode(picture, uint16_t(r.x), uint16_t(r.y + v->bandAt), out);
                         if (n == 0) {
                                 if (v->encoder.isBroken()) return Broken;
@@ -595,24 +815,26 @@ namespace vnc {
                 }
                 if (count == 0) return Nothing;
                 out.patchU16(2, uint16_t(count));
+                if (v->capturedWidth != 0) {
+                        _width = v->capturedWidth; // what a new viewer starts with
+                        _height = v->capturedHeight;
+                }
                 if (_settings.verbose) {
                         const Encoder::Stats &st = v->encoder.stats();
                         fprintf(stderr,
-                                "update: %u rects %llu pixels %u bytes in %llu us on core %d (capture %llu, jpeg %llu, "
-                                "zlib %llu, "
-                                "encode %llu); so far fill %u palette %u jpeg %u basic %u zrle %u raw %u\n",
-                                unsigned(count), (unsigned long long)(st.pixels - _timing.pixelsSeen),
+                                "update %s: %u rects %llu pixels %u bytes in %llu us on core %d (capture %llu, jpeg "
+                                "%llu, zlib %llu, encode %llu)%s\n",
+                                v->name, unsigned(count), (unsigned long long)(st.pixels - v->pixelsSeen),
                                 unsigned(out.size()), (unsigned long long)(nowUs() - t0), _workerCore,
                                 (unsigned long long)_timing.captureUs, (unsigned long long)_timing.jpegUs,
-                                (unsigned long long)(st.zlibUs - _timing.zlibSeen),
-                                (unsigned long long)(st.encodeUs - _timing.encodeSeen), unsigned(st.fills),
-                                unsigned(st.palettes), unsigned(st.jpegs), unsigned(st.basics), unsigned(st.zrle),
-                                unsigned(st.raw));
+                                (unsigned long long)(st.zlibUs - v->zlibSeen),
+                                (unsigned long long)(st.encodeUs - v->encodeSeen),
+                                v->hasLeftover() ? ", more left" : "");
                 }
                 _timing = Timing();
-                _timing.zlibSeen = v->encoder.stats().zlibUs;
-                _timing.encodeSeen = v->encoder.stats().encodeUs;
-                _timing.pixelsSeen = v->encoder.stats().pixels;
+                v->zlibSeen = v->encoder.stats().zlibUs;
+                v->encodeSeen = v->encoder.stats().encodeUs;
+                v->pixelsSeen = v->encoder.stats().pixels;
                 v->outSize = out.size();
                 return Built;
         }
@@ -647,7 +869,7 @@ namespace vnc {
                         if (n < 0 && errno == EINTR) continue;
                         if (n <= 0 || job == 'q') return;
                         const uint64_t t0 = nowUs();
-                        const char     result = char(buildUpdate(_jobAll, _jobFresh) + 8); // 0..15 on the pipe
+                        const char result = char(buildUpdate(_jobViewer, _jobAll, _jobFresh) + 8); // 0..15 on the pipe
                         _workUs += nowUs() - t0;
                         (void)write(_donePipe[1], &result, 1);
                 }
@@ -729,32 +951,35 @@ namespace vnc {
         // ---- The session's events
 
         void Server::Events::ready() {
-                Viewer *v = _server._viewer;
-                if (v == nullptr) return;
-                // Watched only while a viewer is in: the tray's mark (a red dot on our icon) says so.
-                // Its first changed (sent as the watch begins) lets updates start: a capture before
-                // the service took the request would be refused.
-                bmds_screen_share_watch(_server._gui, _server._screen, 1);
+                Viewer *v = _viewer;
+                // Watched only while a viewer is in, each through its own ScreenShare (its own changes):
+                // the tray's mark (a red dot on our icon) says so. Its first changed (sent as the watch
+                // begins) lets its updates start: a capture before the service took it would be refused.
+                v->screen = bmds_screen_share_new(_server._gui, 0);
+                bmds_screen_share_watch(_server._gui, v->screen, 1);
                 v->watching = true;
+                _server.event("%s: watching (input %s)", v->name,
+                              _server._input != nullptr ? _server._input->name
+                              : _server._inputNone      ? "none, chosen"
+                                                        : "free");
+                if (_server._input == nullptr && !_server._inputNone) _server.giveInput(v, false);
                 char body[96];
-                snprintf(body, sizeof(body), "%s is viewing the screen", v->name);
-                _server.notify("Viewer connected", body, "normal", true);
+                snprintf(body, sizeof(body), "%s is viewing the screen%s", v->name,
+                         _server._input == v ? "" : " (watching only)");
+                _server.notify("Viewer connected", body, "normal", &v->notification);
                 _server.refreshTray();
                 return;
         }
 
         // The encoder is the worker's while a job runs: these wait for startUpdate().
         void Server::Events::setPixelFormat(const PixelFormat &format) {
-                Viewer *v = _server._viewer;
-                if (v == nullptr) return;
-                v->format = format;
-                v->pendingFormat = true;
+                _viewer->format = format;
+                _viewer->pendingFormat = true;
                 return;
         }
 
         void Server::Events::setEncodings(const int32_t *encodings, size_t count) {
-                Viewer *v = _server._viewer;
-                if (v == nullptr) return;
+                Viewer *v = _viewer;
                 v->encodingCount = count < 64 ? count : 64;
                 for (size_t i = 0; i < v->encodingCount; ++i) v->encodings[i] = encodings[i];
                 v->pendingEncodings = true;
@@ -762,48 +987,71 @@ namespace vnc {
         }
 
         void Server::Events::updateRequest(bool incremental, uint16_t, uint16_t, uint16_t, uint16_t) {
-                Viewer *v = _server._viewer;
-                if (v == nullptr) return;
-                v->requested = true;
-                if (!incremental) v->full = true;
+                _viewer->requested = true;
+                if (!incremental) _viewer->full = true;
                 return;
         }
 
+        // Keys and the pointer only from the viewer with the input; the others watch.
         void Server::Events::key(bool down, uint32_t keysym) {
-                Viewer *v = _server._viewer;
-                if (v == nullptr) return;
+                Viewer *v = _viewer;
+                if (v != _server._input) return;
                 const KeyState::Key k = v->keys.event(down, keysym);
-                if (k.usage != 0)
-                        bmds_screen_share_inject_key(_server._gui, _server._screen, k.usage, k.modifiers, down ? 1 : 0);
+                if (k.usage != 0) {
+                        const int r = bmds_screen_share_inject_key(_server._gui, _server._inputShare, k.usage,
+                                                                   k.modifiers, down ? 1 : 0);
+                        if (r != 0 && v->refused++ < 5)
+                                _server.event("%s: key 0x%x (usage %u) refused: %d", v->name, unsigned(keysym),
+                                              unsigned(k.usage), r);
+                }
                 return;
         }
 
         void Server::Events::pointer(uint8_t buttons, uint16_t x, uint16_t y) {
-                Viewer *v = _server._viewer;
-                if (v == nullptr) return;
+                Viewer *v = _viewer;
+                if (v != _server._input) return;
                 // The wheel: buttons 4 and 5 (away, towards), a notch at each press.
                 const uint8_t pressed = uint8_t(buttons & ~v->buttons);
                 const int     wheel = ((pressed & 0x08) ? 1 : 0) - ((pressed & 0x10) ? 1 : 0);
                 v->buttons = buttons;
-                const int32_t px = x < _server._width ? x : int32_t(_server._width) - 1;
-                const int32_t py = y < _server._height ? y : int32_t(_server._height) - 1;
-                bmds_screen_share_inject_pointer(_server._gui, _server._screen, px, py, bmdsButtons(buttons), wheel);
+                const int32_t px = x < v->width ? x : int32_t(v->width) - 1;
+                const int32_t py = y < v->height ? y : int32_t(v->height) - 1;
+                const int     r = bmds_screen_share_inject_pointer(_server._gui, _server._inputShare, px, py,
+                                                                   bmdsButtons(buttons), wheel);
+                if (r != 0 && v->refused++ < 5)
+                        _server.event("%s: pointer %d,%d buttons %u refused: %d", v->name, int(px), int(py),
+                                      unsigned(buttons), r);
+                return;
+        }
+
+        // The viewer with the input copied: onto the board's clipboard as UTF-8 (our copy: its changed
+        // isn't sent back). A watching viewer's copies are input too, and left.
+        void Server::Events::cutText(const char *text, size_t length) {
+                if (_viewer != _server._input || _server._clipboard == 0) return;
+                char *utf8 = static_cast<char *>(malloc(length * 2 + 1));
+                if (utf8 == nullptr) return;
+                const size_t n = vnc::Text::utf8FromLatin1(text, length, utf8, length * 2);
+                utf8[n] = '\0';
+                (void)bmds_clipboard_copy_text(_server._gui, _server._clipboard, "clipboard", utf8);
+                if (_server._settings.verbose) fprintf(stderr, "clipboard: %u bytes from the viewer\n", unsigned(n));
+                free(utf8);
                 return;
         }
 
         // ---- Telling the user (devplan/vnc.md §5d)
 
-        void Server::notify(const char *title, const char *body, const char *urgency, bool withDisconnect) {
+        // @p withDisconnect: the notification has Disconnect, its id kept there (its viewer's).
+        void Server::notify(const char *title, const char *body, const char *urgency, uint32_t *withDisconnect) {
                 const uint32_t n = bmds_notification_new(_gui, 0);
                 bmds_notification_set_app(_gui, n, "VNC Server");
                 bmds_notification_set_icon(_gui, n, TrayIconName);
                 bmds_notification_set_title(_gui, n, title);
                 bmds_notification_set_body(_gui, n, body);
                 bmds_notification_set_urgency(_gui, n, urgency);
-                if (withDisconnect) {
+                if (withDisconnect != nullptr) {
                         const char *actions[] = {"Disconnect"};
                         bmds_notification_set_actions(_gui, n, actions, 1);
-                        _notification = n;
+                        *withDisconnect = n;
                 } else {
                         bmds_notification_set_transient(_gui, n, 1);
                 }
@@ -811,19 +1059,58 @@ namespace vnc {
                 return;
         }
 
+        // The tip, and the menu made again (its entries keep the order they are made in): the
+        // viewers' line, Give Input To (each viewer, None), Disconnect All, Blank Display, Stop.
         void Server::refreshTray() {
-                char tip[128], line[64];
-                if (_viewer != nullptr && _viewer->watching) {
-                        const unsigned minutes = unsigned((nowMs() - _viewer->sinceMs) / 60000u);
-                        snprintf(tip, sizeof(tip), "VNC server on %s: %s watching", _address, _viewer->name);
-                        snprintf(line, sizeof(line), "%s, %u min", _viewer->name, minutes);
-                } else {
+                if (_tray == 0) return;
+                char   tip[160], line[64];
+                size_t watching = 0;
+                for (size_t i = 0; i < _viewerCount; ++i) watching += _viewers[i]->watching ? 1 : 0;
+                if (watching == 0) {
                         snprintf(tip, sizeof(tip), "VNC server on %s: no viewer", _address);
                         snprintf(line, sizeof(line), "No viewer");
+                } else {
+                        snprintf(tip, sizeof(tip), "VNC server on %s: %u watching%s%s%s", _address, unsigned(watching),
+                                 _input != nullptr ? ", input " : "", _input != nullptr ? "from " : "",
+                                 _input != nullptr ? _input->name : "");
+                        snprintf(line, sizeof(line), "%u viewer%s", unsigned(watching), watching == 1 ? "" : "s");
                 }
                 bmds_tray_icon_set_tool_tip(_gui, _tray, tip);
-                bmds_menu_item_set_text(_gui, _menuViewer, line);
-                bmds_menu_item_set_enabled(_gui, _menuDisconnect, _viewer != nullptr ? 1 : 0);
+                if (_trayMenu != 0) bmds_gui_destroy(_gui, _trayMenu);
+                _trayMenu = bmds_menu_new(_gui, _tray); // a tray icon's menu: its context menu
+                _menuViewers = bmds_menu_item_new(_gui, _trayMenu);
+                bmds_menu_item_set_text(_gui, _menuViewers, line);
+                bmds_menu_item_set_enabled(_gui, _menuViewers, 0);
+                _menuInput = bmds_menu_new(_gui, _trayMenu);
+                bmds_menu_set_title(_gui, _menuInput, "Give &Input To");
+                for (size_t i = 0; i < MaxViewers; ++i) _menuInputTo[i] = 0;
+                for (size_t i = 0; i < _viewerCount; ++i) {
+                        const Viewer *v = _viewers[i];
+                        if (!v->watching) continue;
+                        const unsigned minutes = unsigned((nowMs() - v->sinceMs) / 60000u);
+                        char           text[64];
+                        snprintf(text, sizeof(text), "%s, %u min", v->name, minutes);
+                        _menuInputTo[i] = bmds_menu_item_new(_gui, _menuInput);
+                        bmds_menu_item_set_text(_gui, _menuInputTo[i], text);
+                        bmds_menu_item_set_checked(_gui, _menuInputTo[i], v == _input ? 1 : 0);
+                }
+                bmds_menu_add_separator(_gui, _menuInput);
+                _menuInputNone = bmds_menu_item_new(_gui, _menuInput);
+                bmds_menu_item_set_text(_gui, _menuInputNone, "&None (everyone watches)");
+                bmds_menu_item_set_checked(_gui, _menuInputNone, _input == nullptr ? 1 : 0);
+                _menuDisconnect = bmds_menu_item_new(_gui, _trayMenu);
+                bmds_menu_item_set_text(_gui, _menuDisconnect, watching > 1 ? "&Disconnect All" : "&Disconnect");
+                bmds_menu_item_set_enabled(_gui, _menuDisconnect, _viewerCount > 0 ? 1 : 0);
+                _menuBlank = 0;
+                if (_outputId >= 0) {
+                        bmds_menu_add_separator(_gui, _trayMenu);
+                        _menuBlank = bmds_menu_item_new(_gui, _trayMenu);
+                        bmds_menu_item_set_text(_gui, _menuBlank, "&Blank Display While Connected");
+                        readBlank();
+                }
+                bmds_menu_add_separator(_gui, _trayMenu);
+                _menuStop = bmds_menu_item_new(_gui, _trayMenu);
+                bmds_menu_item_set_text(_gui, _menuStop, "&Stop Server");
                 return;
         }
 
@@ -832,7 +1119,7 @@ namespace vnc {
                 if (_outputId < 0 || bmds_sysconf_get(_outputId, BMDS_SYSCONF_FIELD_VALUE, value, sizeof(value)) < 0)
                         return;
                 _blank = strcmp(value, "remote") == 0;
-                bmds_menu_item_set_checked(_gui, _menuBlank, _blank ? 1 : 0);
+                if (_menuBlank != 0) bmds_menu_item_set_checked(_gui, _menuBlank, _blank ? 1 : 0);
                 return;
         }
 
@@ -841,7 +1128,7 @@ namespace vnc {
         void Server::toggleBlank() {
                 const char *want = _blank ? "on" : "remote";
                 if (bmds_sysconf_set(_outputId, BMDS_SYSCONF_OP_SET, want) < 0) {
-                        notify("VNC server", "The display setting can't be changed", "normal", false);
+                        notify("VNC server", "The display setting can't be changed", "normal", nullptr);
                         readBlank();
                         return;
                 }
@@ -880,10 +1167,10 @@ namespace vnc {
                         slot->refusedUntilMs = now + RefusedMs;
                         snprintf(body, sizeof(body), "%s: %u wrong passwords; refused for a minute", name,
                                  unsigned(slot->count));
-                        notify("VNC: someone is guessing", body, "critical", false);
+                        notify("VNC: someone is guessing", body, "critical", nullptr);
                 } else {
                         snprintf(body, sizeof(body), "%s gave a wrong password", name);
-                        notify("VNC: wrong password", body, "normal", false);
+                        notify("VNC: wrong password", body, "normal", nullptr);
                 }
                 return;
         }

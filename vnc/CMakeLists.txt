@@ -15,7 +15,8 @@ target_include_directories(vnc_zlib PUBLIC ${CMAKE_CURRENT_LIST_DIR}/../thirdpar
 target_link_libraries(vnc_zlib PUBLIC bmds_headers)
 target_compile_options(vnc_zlib PRIVATE -O2)
 
-add_library(vnc_core STATIC core/des.cpp core/encode.cpp core/keysym.cpp core/pixelformat.cpp core/rfb.cpp)
+add_library(vnc_core STATIC core/des.cpp core/encode.cpp core/keysym.cpp core/pixelformat.cpp core/rfb.cpp
+            core/text.cpp)
 target_include_directories(vnc_core PUBLIC core)
 target_link_libraries(vnc_core PUBLIC bmds_headers vnc_zlib)
 target_compile_options(vnc_core PRIVATE -O2 -Wall -Wextra -Werror)
