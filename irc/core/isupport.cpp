@@ -35,8 +35,24 @@ namespace irc {
                 put(_listModes, sizeof(_listModes), "beI");
                 put(_alwaysModes, sizeof(_alwaysModes), "k");
                 put(_setModes, sizeof(_setModes), "l");
+                put(_elist, sizeof(_elist), "");
+                _monitor = -1;
+                _modes = 3;
                 return;
         }
+
+        namespace {
+                // A token's number (digits only, at most 9 of them), or @p otherwise.
+                int32_t number(Text value, int32_t otherwise) {
+                        if (value.isEmpty() || value.size() > 9) return otherwise;
+                        int32_t n = 0;
+                        for (char c : value) {
+                                if (c < '0' || c > '9') return otherwise;
+                                n = n * 10 + (c - '0');
+                        }
+                        return n;
+                }
+        } // namespace
 
         void Isupport::apply(const Message &message) {
                 // 005 NICK TOKEN TOKEN=VALUE ... :are supported by this server
@@ -50,6 +66,14 @@ namespace irc {
                                 _caseMapping = value == Text("ascii")            ? CaseMapping::Ascii
                                                : value == Text("strict-rfc1459") ? CaseMapping::StrictRfc1459
                                                                                  : CaseMapping::Rfc1459;
+                        } else if (key == Text("ELIST")) {
+                                put(_elist, sizeof(_elist), value);
+                        } else if (key == Text("MONITOR")) {
+                                _monitor = negated ? -1 : number(value, 0); // no value: no limit
+                        } else if (key == Text("MODES")) {
+                                // Without a value: no limit said; 3 stays a safe number.
+                                const int32_t n = number(value, 3);
+                                _modes = negated || n <= 0 ? 3 : uint32_t(n > 100 ? 100 : n);
                         } else if (key == Text("NETWORK")) {
                                 put(_network, sizeof(_network), value);
                         } else if (key == Text("CHANTYPES")) {
@@ -101,6 +125,10 @@ namespace irc {
         size_t Isupport::rank(char prefix) const {
                 const size_t at = Text(_prefixChars).find(prefix);
                 return at != Text::NoPos ? at : std::strlen(_prefixChars);
+        }
+
+        bool Isupport::isListMode(char mode) const {
+                return Text(_listModes).find(mode) != Text::NoPos;
         }
 
         bool Isupport::takesParameter(char mode, bool setting) const {

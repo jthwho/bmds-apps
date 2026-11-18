@@ -11,6 +11,7 @@
 #include "commands.h"
 #include "complete.h"
 #include "helpers.h"
+#include "ignore.h"
 
 using irc::Buffer;
 using irc::Error;
@@ -135,7 +136,7 @@ TEST_CASE("Commands: /join /part /close /nick /topic /away /back") {
         CHECK(w.type("/topic a new one", w.bmds) == Lines{"TOPIC #bmds :a new one"});
         CHECK(w.type("/topic #other theirs", w.bmds) == Lines{"TOPIC #other :theirs"});
         CHECK(w.type("/away lunch", w.bmds) == Lines{"AWAY :lunch"});
-        CHECK(w.type("/away", w.bmds) == Lines{"AWAY :Away"});
+        CHECK(w.type("/away", w.bmds) == Lines{"AWAY"}); // alone: back, as mIRC's
         CHECK(w.type("/back", w.bmds) == Lines{"AWAY"});
 }
 
@@ -197,4 +198,162 @@ TEST_CASE("Tab: nicks (who spoke last first), each Tab the next; channels; comma
         // Someone who left isn't offered, though they spoke.
         w.s.say(":alan!a@h PART #bmds");
         CHECK(w.tab("a") == "alice: ");
+}
+
+TEST_CASE("Commands: the operator's in MODES-sized lines, bans from a host, kick and ban, half-ops") {
+        World w;
+        CHECK(w.type("/op alice bob alan jth", w.bmds) == Lines{"MODE #bmds +ooo alice bob alan", "MODE #bmds +o jth"});
+        CHECK(w.type("/devoice #other a", w.bmds) == Lines{"MODE #other -v a"});
+        CHECK(w.type("/deop", w.bmds).empty());
+        CHECK(w.told().find("Usage: /op") != std::string::npos);
+        CHECK(w.type("/op bob", w.network).empty()); // no channel in view, none named
+        CHECK(w.type("/hop bob", w.bmds).empty());
+        CHECK(w.told().find("no half-operators") != std::string::npos);
+        w.s.say(":srv 005 jth MODES=4 PREFIX=(qaohv)~&@%+ :are supported");
+        CHECK(w.type("/hop a b c d e", w.bmds) == Lines{"MODE #bmds +hhhh a b c d", "MODE #bmds +h e"});
+        CHECK(w.type("/dehop a", w.bmds) == Lines{"MODE #bmds -h a"});
+
+        // A ban by their host when it is known (their join), else by nick; a mask as given.
+        w.s.say(":carol!c@host.example JOIN #bmds");
+        CHECK(w.type("/ban carol", w.bmds) == Lines{"MODE #bmds +b *!*@host.example"});
+        CHECK(w.type("/ban bob", w.bmds) == Lines{"MODE #bmds +b bob!*@*"});
+        CHECK(w.type("/unban *!*@spam.example", w.bmds) == Lines{"MODE #bmds -b *!*@spam.example"});
+        CHECK(w.type("/ban #other spammer!x", w.bmds) == Lines{"MODE #other +b spammer!x@*"});
+        CHECK(w.type("/kb carol go away", w.bmds) ==
+              Lines{"MODE #bmds +b *!*@host.example", "KICK #bmds carol :go away"});
+        CHECK(w.type("/kb carol", w.bmds) == Lines{"MODE #bmds +b *!*@host.example", "KICK #bmds carol"});
+        CHECK(w.type("/ban", w.bmds).empty());
+        CHECK(w.type("/ban a*b", w.bmds).empty()); // a nick with a star: not one
+        CHECK(w.told().find("Not a nick or a mask") != std::string::npos);
+}
+
+TEST_CASE("Commands: CTCP and /ping, /who /whowas, /mode alone, /away alone") {
+        World w;
+        CHECK(w.type("/ctcp alice version", w.bmds) == Lines{"PRIVMSG alice :\x01VERSION\x01"});
+        CHECK(w.type("/ctcp alice clientinfo now", w.bmds) == Lines{"PRIVMSG alice :\x01"
+                                                                    "CLIENTINFO now\x01"});
+        const Lines ping = w.type("/ping alice", w.bmds);
+        REQUIRE(ping.size() == 1);
+        CHECK(ping[0].rfind("PRIVMSG alice :\x01PING ", 0) == 0);
+        CHECK(w.type("/ping", w.bmds).empty());
+        CHECK(w.type("/who #bmds", w.bmds) == Lines{"WHO #bmds"});
+        CHECK(w.type("/whowas bob", w.bmds) == Lines{"WHOWAS bob"});
+        CHECK(w.type("/mode", w.bmds) == Lines{"MODE #bmds"});
+        CHECK(w.type("/mode", w.network) == Lines{"MODE jth"});
+}
+
+TEST_CASE("Commands: what the window does: /list /find /ignore /notify /server") {
+        World w;
+        CHECK(w.type("/list linux", w.bmds).empty());
+        CHECK(w.outcome.action == Outcome::Action::List);
+        CHECK(w.outcome.text == Text("linux"));
+        CHECK(w.type("/find needle", w.bmds).empty());
+        CHECK(w.outcome.action == Outcome::Action::Find);
+        CHECK(w.outcome.buffer == w.bmds);
+        CHECK(w.outcome.text == Text("needle"));
+
+        CHECK(w.type("/ignore bob", w.bmds).empty());
+        CHECK(w.outcome.action == Outcome::Action::Ignore);
+        CHECK(w.outcome.on);
+        CHECK(w.outcome.text == Text("bob!*@*"));
+        CHECK(w.outcome.extra.isEmpty());
+        w.type("/ignore *@spam.example Libera.Chat", w.bmds);
+        CHECK(w.outcome.text == Text("*!*@spam.example"));
+        CHECK(w.outcome.extra == Text("Libera.Chat"));
+        w.type("/ignore", w.bmds); // the list
+        CHECK(w.outcome.action == Outcome::Action::Ignore);
+        CHECK(w.outcome.text.isEmpty());
+        w.type("/unignore bob", w.bmds);
+        CHECK(w.outcome.action == Outcome::Action::Ignore);
+        CHECK(!w.outcome.on);
+        w.type("/unignore", w.bmds);
+        CHECK(w.outcome.action == Outcome::Action::None);
+        w.type("/ignore !x@y", w.bmds);
+        CHECK(w.outcome.action == Outcome::Action::None);
+
+        w.type("/notify alice", w.bmds);
+        CHECK(w.outcome.action == Outcome::Action::Notify);
+        CHECK(w.outcome.on);
+        CHECK(w.outcome.text == Text("alice"));
+        w.type("/unnotify alice", w.bmds);
+        CHECK(!w.outcome.on);
+        w.type("/notify #bmds", w.bmds);
+        CHECK(w.outcome.action == Outcome::Action::None);
+
+        const struct {
+                        const char *typed, *host;
+                        uint16_t    port;
+                        bool        tls, fresh;
+        } servers[] = {{"/server irc.example.net", "irc.example.net", 6697, true, false},
+                       {"/server -m irc.example.net 6667", "irc.example.net", 6667, false, true},
+                       {"/server irc.example.net +7000", "irc.example.net", 7000, true, false},
+                       {"/server irc.example.net:6697", "irc.example.net", 6697, true, false},
+                       {"/server irc.example.net:6667", "irc.example.net", 6667, false, false}};
+        for (const auto &s : servers) {
+                CAPTURE(s.typed);
+                CHECK(w.type(s.typed, w.bmds).empty());
+                CHECK(w.outcome.action == Outcome::Action::Server);
+                CHECK(w.outcome.text == Text(s.host));
+                CHECK(w.outcome.port == s.port);
+                CHECK(w.outcome.on == s.tls);
+                CHECK(w.outcome.fresh == s.fresh);
+        }
+        w.type("/server", w.bmds);
+        CHECK(w.outcome.action == Outcome::Action::None);
+        w.type("/server host 70000", w.bmds);
+        CHECK(w.outcome.action == Outcome::Action::None);
+}
+
+TEST_CASE("Ban masks and ignore masks: normalized, matched with wildcards and casemapping") {
+        irc::String m;
+        CHECK(irc::banMask("bob", "b@host.example", m) == Error::Ok);
+        CHECK(m == Text("*!*@host.example"));
+        CHECK(irc::banMask("bob", "", m) == Error::Ok);
+        CHECK(m == Text("bob!*@*"));
+        CHECK(irc::banMask("x!y@z", "", m) == Error::Ok);
+        CHECK(m == Text("x!y@z"));
+        CHECK(irc::banMask("", "", m) == Error::Invalid);
+
+        CHECK(irc::Ignores::normalize("u@h", m) == Error::Ok);
+        CHECK(m == Text("*!u@h"));
+        CHECK(irc::Ignores::normalize("n!u", m) == Error::Ok);
+        CHECK(m == Text("n!u@*"));
+        CHECK(irc::Ignores::normalize("a b", m) == Error::Invalid);
+        CHECK(irc::Ignores::normalize("n!@h", m) == Error::Invalid);
+        CHECK(irc::Ignores::normalize("n!u@", m) == Error::Invalid);
+
+        const auto r = irc::CaseMapping::Rfc1459;
+        CHECK(irc::matchesMask("*", "", r));
+        CHECK(irc::matchesMask("a*b?d", "aXXbcd", r));
+        CHECK(!irc::matchesMask("a*b?d", "aXXbd", r));
+        CHECK(irc::matchesMask("[x]*", "{X}yz", r)); // rfc1459: [ is {
+        CHECK(!irc::matchesMask("[x]*", "{X}yz", irc::CaseMapping::Ascii));
+        CHECK(!irc::matchesMask("*a*a*a*a*a*a*a*a*b", std::string(200, 'a').c_str(), r)); // no blow-up
+
+        irc::Ignores ig;
+        REQUIRE(ig.read("bob, *!*@spam.example@Libera.Chat, , carol!*@*") == Error::Ok);
+        REQUIRE(ig.size() == 3);
+        CHECK(ig.networkAt(1) == Text("Libera.Chat"));
+        CHECK(ig.matches("BOB", "u", "h", "OFTC", r));
+        CHECK(ig.matches("x", "y", "spam.example", "libera.chat", r));
+        CHECK(!ig.matches("x", "y", "spam.example", "OFTC", r));
+        CHECK(!ig.matches("alice", "", "", "OFTC", r));
+        CHECK(ig.add("bob", "") == Error::Ok); // already there
+        CHECK(ig.size() == 3);
+        CHECK(ig.remove("carol", ""));
+        CHECK(!ig.remove("carol", ""));
+        irc::String out;
+        REQUIRE(ig.write(out) == Error::Ok);
+        CHECK(out == Text("bob!*@*, *!*@spam.example@Libera.Chat"));
+}
+
+TEST_CASE("Perform's lines: $me our nick, a / added") {
+        irc::String out;
+        CHECK(irc::performLine("/mode $me +x", "jth", out) == Error::Ok);
+        CHECK(out == Text("/mode jth +x"));
+        CHECK(irc::performLine("  msg Q@CServe.quakenet.org AUTH $me secret", "jth", out) == Error::Ok);
+        CHECK(out == Text("/msg Q@CServe.quakenet.org AUTH jth secret"));
+        CHECK(irc::performLine("/echo $meal $me", "jth", out) == Error::Ok);
+        CHECK(out == Text("/echo $meal jth"));
+        CHECK(irc::performLine("   ", "jth", out) == Error::Invalid);
 }

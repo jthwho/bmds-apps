@@ -17,9 +17,9 @@ namespace irc {
         namespace {
 
                 // The capabilities asked for when offered (devplan/irc.md §1); SASL only with a login.
-                const char *const WantedCaps[] = {"server-time",    "message-tags",  "away-notify",
-                                                  "account-notify", "extended-join", "multi-prefix",
-                                                  "cap-notify",     "chghost",       "echo-message"};
+                const char *const WantedCaps[] = {"server-time",   "message-tags",     "away-notify", "account-notify",
+                                                  "extended-join", "multi-prefix",     "cap-notify",  "chghost",
+                                                  "echo-message",  "userhost-in-names"};
 
                 bool hasBreak(Text text) {
                         for (char c : text)
@@ -63,6 +63,29 @@ namespace irc {
                         for (const String &s : list)
                                 if (s.view().equalsIgnoringCase(item)) return true;
                         return false;
+                }
+
+                // A decimal number's value (digits only), or -1.
+                int64_t decimal(Text text) {
+                        if (text.isEmpty() || text.size() > 18) return -1;
+                        int64_t n = 0;
+                        for (char c : text) {
+                                if (c < '0' || c > '9') return -1;
+                                n = n * 10 + (c - '0');
+                        }
+                        return n;
+                }
+
+                void appendDecimal(String &out, int64_t n) {
+                        char   digits[20];
+                        size_t k = 0;
+                        if (n < 0) n = 0;
+                        do {
+                                digits[k++] = char('0' + n % 10);
+                                n /= 10;
+                        } while (n > 0 && k < sizeof(digits));
+                        while (k > 0) (void)out.append(digits[--k]);
+                        return;
                 }
 
         } // namespace
@@ -175,6 +198,53 @@ namespace irc {
                 return const_cast<Session *>(this)->findChannel(name);
         }
 
+        Text Session::hostOf(Text nick) const {
+                for (const Channel &c : _channels)
+                        for (const Member &m : c.members)
+                                if (!m.host.isEmpty() && sameName(m.nick, nick, _isupport.caseMapping())) return m.host;
+                return Text();
+        }
+
+        int Session::online(Text nick) const {
+                for (const Watched &w : _watched)
+                        if (sameName(w.nick, nick, _isupport.caseMapping())) return w.state;
+                return -1;
+        }
+
+        void Session::setIgnores(const Ignores *ignores, Text network) {
+                _ignores = ignores;
+                (void)_networkName.assign(network);
+                return;
+        }
+
+        // From someone ignored: counted, told a minute after the first (devplan/irc.md §7f).
+        bool Session::ignored(const Source &src, const Now &now) {
+                if (_ignores == nullptr || src.nick.isEmpty() || src.isServer() || isMe(src.nick)) return false;
+                if (!_ignores->matches(src.nick, src.user, src.host, _networkName, _isupport.caseMapping()))
+                        return false;
+                ++_ignoredCount;
+                if (_ignoredAt < 0) _ignoredAt = now.mono + IgnoredEveryMs;
+                return true;
+        }
+
+        void Session::setChannelMode(Channel &c, char mode, bool on, Text param) {
+                for (size_t i = 0; i < c.modes.size(); ++i)
+                        if (c.modes[i].mode == mode) {
+                                if (!on) {
+                                        c.modes.removeAt(i);
+                                } else {
+                                        (void)c.modes[i].param.assign(param);
+                                }
+                                return;
+                        }
+                if (!on) return;
+                ChannelMode m;
+                m.mode = mode;
+                if (m.param.assign(param) != Error::Ok) return;
+                (void)c.modes.append(std::move(m));
+                return;
+        }
+
         Member *Session::findMember(Channel &channel, Text nick) {
                 for (Member &m : channel.members)
                         if (sameName(m.nick, nick, _isupport.caseMapping())) return &m;
@@ -202,6 +272,7 @@ namespace irc {
                 while (i < item.size() && prefixChars.find(item[i]) != Text::NoPos) ++i;
                 Text         nick = item.mid(i);
                 const size_t bang = nick.find('!');
+                const Text   host = bang != Text::NoPos ? nick.mid(bang + 1) : Text();
                 if (bang != Text::NoPos) nick = nick.left(bang);
                 if (nick.isEmpty()) return;
                 Member *m = findMember(channel, nick);
@@ -213,6 +284,7 @@ namespace irc {
                         m = &channel.members.last();
                 }
                 for (size_t k = 0; k < i; ++k) setPrefix(*m, item[k], true);
+                if (!host.isEmpty()) (void)m->host.assign(host);
                 return;
         }
 
@@ -237,6 +309,12 @@ namespace irc {
                 _lastReceived = now.mono;
                 _pingSent = -1;
                 _timedOut = false;
+                _performAsked = false;
+                _performDone = false;
+                _watching = false;
+                _isonAt = -1;
+                _isonAsked.clear();
+                for (Watched &w : _watched) w.state = -1;
                 _credit = Burst * PaceMs;
                 _creditAt = now.mono;
                 const Text user = _config.user.isEmpty() ? _config.nick.view() : _config.user.view();
@@ -271,6 +349,11 @@ namespace irc {
                 _joinAt = -1;
                 _regainAt = -1;
                 _pingSent = -1;
+                _watching = false;
+                _isonAt = -1;
+                _isonAsked.clear();
+                for (Watched &w : _watched) w.state = -1;
+                for (Rejoin &r : _rejoins) r.at = -1;
                 return;
         }
 
@@ -293,6 +376,22 @@ namespace irc {
                                 send(Kind::Protocol, "NICK", n, 1, false);
                         }
                 }
+                if (_isonAt >= 0 && now.mono >= _isonAt) sendIson(now);
+                if (_ignoredAt >= 0 && now.mono >= _ignoredAt) {
+                        Event e = make(Event::Kind::Ignored, Event::Server, "", "", "", now.wall);
+                        e.number = _ignoredCount;
+                        emit(std::move(e));
+                        _ignoredCount = 0;
+                        _ignoredAt = -1;
+                }
+                for (Rejoin &r : _rejoins) {
+                        if (r.at < 0 || now.mono < r.at) continue;
+                        r.at = -1;
+                        r.last = now.mono;
+                        if (_state != State::Registered) continue;
+                        const Text p[] = {r.name, r.key};
+                        send(Kind::Protocol, "JOIN", p, r.key.isEmpty() ? 1 : 2, false);
+                }
                 return;
         }
 
@@ -309,6 +408,9 @@ namespace irc {
                 if (_pingSent < 0 && _state == State::Registered) consider(_lastReceived + PingAfterMs);
                 consider(_joinAt);
                 consider(_regainAt);
+                consider(_isonAt);
+                consider(_ignoredAt);
+                for (const Rejoin &r : _rejoins) consider(r.at);
                 return soonest;
         }
 
@@ -370,6 +472,7 @@ namespace irc {
                                 Channel &c = _channels[i];
                                 if (!sameName(c.name, name, _isupport.caseMapping())) continue;
                                 if (me) {
+                                        if (_config.rejoin) scheduleRejoin(c, now);
                                         _channels.removeAt(i);
                                 } else {
                                         for (size_t k = 0; k < c.members.size(); ++k)
@@ -407,8 +510,11 @@ namespace irc {
                                 if (isMe(_config.nick)) _regainAt = -1;
                         }
                 } else if (m.is("TOPIC") && m.paramCount >= 1) {
-                        if (Channel *c = findChannel(m.param(0)); c != nullptr)
+                        if (Channel *c = findChannel(m.param(0)); c != nullptr) {
                                 (void)Format::toUtf8(m.param(1), c->topic);
+                                (void)c->topicBy.assign(src.nick);
+                                c->topicAt = timeOf(m, now);
+                        }
                         emit(make(Event::Kind::Topic, isMe(src.nick) ? Event::Self : 0, m.param(0), src.nick,
                                   m.param(1), timeOf(m, now)));
                 } else if (m.is("MODE")) {
@@ -427,8 +533,23 @@ namespace irc {
                                 (void)_selfUser.assign(m.param(0));
                                 (void)_selfHost.assign(m.param(1));
                         }
+                        for (Channel &c : _channels)
+                                if (Member *member = findMember(c, src.nick); member != nullptr) {
+                                        (void)member->host.assign(m.param(0));
+                                        (void)member->host.append('@');
+                                        (void)member->host.append(m.param(1));
+                                }
                 } else if (m.is("INVITE") && m.paramCount >= 2) {
-                        emit(make(Event::Kind::Invite, 0, "", src.nick, m.param(1), timeOf(m, now)));
+                        if (ignored(src, now)) return;
+                        const Text channel = m.param(1);
+                        Event      e = make(Event::Kind::Invite, 0, "", src.nick, channel, timeOf(m, now));
+                        if (_config.joinInvited && isName(channel) && _isupport.isChannel(channel) &&
+                            findChannel(channel) == nullptr) {
+                                (void)e.extra.assign("joining");
+                                const Text p[] = {channel};
+                                send(Kind::Protocol, "JOIN", p, 1, false);
+                        }
+                        emit(std::move(e));
                 } else if (m.is("ERROR")) {
                         emit(make(Event::Kind::Error, Event::Server, "", "", m.last(), now.wall));
                 }
@@ -606,9 +727,15 @@ namespace irc {
 
         void Session::joinAll() {
                 if (_joinsDone) return;
-                _joinsDone = true;
                 _identifying = false;
                 _joinAt = -1;
+                // Perform first (devplan/irc.md §7f): the app runs its lines, then performed().
+                if (!_config.perform.isEmpty() && !_performDone) {
+                        if (!_performAsked) emit(make(Event::Kind::Perform, Event::Server, "", "", "", 0));
+                        _performAsked = true;
+                        return;
+                }
+                _joinsDone = true;
                 // The settings' channels ("#chan" or "#chan key"), then those of the last connection.
                 Vector<String> names;
                 for (const String &entry : _config.autojoin) {
@@ -634,6 +761,123 @@ namespace irc {
                 return;
         }
 
+        void Session::performed() {
+                _performDone = true;
+                if (_performAsked && _state == State::Registered) joinAll();
+                return;
+        }
+
+        // ---- Watching nicks (devplan/irc.md §7g): MONITOR, else ISON each minute
+
+        void Session::monitor(char sign, const Vector<String> &nicks) {
+                // MONITOR + a,b,c in lines of at most 400 bytes of nicks.
+                String     list;
+                const char s[2] = {sign, '\0'};
+                for (size_t i = 0; i <= nicks.size(); ++i) {
+                        const bool flush = i == nicks.size() || list.size() + nicks[i].size() + 1 > 400;
+                        if (flush && !list.isEmpty()) {
+                                const Text p[] = {s, list};
+                                send(Kind::Protocol, "MONITOR", p, 2, false);
+                                list.clear();
+                        }
+                        if (i == nicks.size()) break;
+                        if (!list.isEmpty()) (void)list.append(',');
+                        (void)list.append(nicks[i]);
+                }
+                return;
+        }
+
+        void Session::startWatching(const Now &now) {
+                _watching = true;
+                if (_watched.isEmpty()) return;
+                if (_isupport.monitor() >= 0) {
+                        Vector<String> nicks;
+                        const size_t   most = _isupport.monitor() > 0 ? size_t(_isupport.monitor()) : SIZE_MAX;
+                        for (const Watched &w : _watched) {
+                                if (nicks.size() >= most) break; // past the server's limit: not watched
+                                String n;
+                                if (n.assign(w.nick) == Error::Ok) (void)nicks.append(std::move(n));
+                        }
+                        monitor('+', nicks);
+                } else {
+                        sendIson(now);
+                }
+                return;
+        }
+
+        void Session::sendIson(const Now &now) {
+                _isonAt = -1;
+                if (_watched.isEmpty() || _state != State::Registered) return;
+                // One line: the nicks that fit in it (an ISON answer names only who is on).
+                String list;
+                _isonAsked.clear();
+                for (const Watched &w : _watched) {
+                        if (list.size() + w.nick.size() + 1 > 400) break;
+                        if (!list.isEmpty()) (void)list.append(' ');
+                        (void)list.append(w.nick);
+                        String n;
+                        if (n.assign(w.nick) == Error::Ok) (void)_isonAsked.append(std::move(n));
+                }
+                const Text p[] = {list};
+                send(Kind::Protocol, "ISON", p, 1, true);
+                _isonAt = now.mono + IsonEveryMs;
+                return;
+        }
+
+        void Session::setOnline(Text nick, bool on, Text host, const Now &now) {
+                for (Watched &w : _watched) {
+                        if (!sameName(w.nick, nick, _isupport.caseMapping())) continue;
+                        const int8_t was = w.state;
+                        w.state = on ? 1 : 0;
+                        // On: said when it wasn't; off: only after being seen on.
+                        if (on && was != 1) {
+                                Event e = make(Event::Kind::Online, Event::Server, "", w.nick, "", now.wall);
+                                (void)e.extra.assign(host);
+                                emit(std::move(e));
+                        } else if (!on && was == 1) {
+                                emit(make(Event::Kind::Offline, Event::Server, "", w.nick, "", now.wall));
+                        }
+                        return;
+                }
+                return;
+        }
+
+        Error Session::watch(Text nick) {
+                if (!isName(nick) || nick[0] == ':' || nick.find('!') != Text::NoPos) return Error::Malformed;
+                for (const Watched &w : _watched)
+                        if (sameName(w.nick, nick, _isupport.caseMapping())) return Error::Ok;
+                Watched w;
+                if (w.nick.assign(nick) != Error::Ok || _watched.append(std::move(w)) != Error::Ok) return Error::NoMem;
+                if (!_watching || _state != State::Registered) return Error::Ok;
+                if (_isupport.monitor() >= 0) {
+                        if (_isupport.monitor() > 0 && _watched.size() > size_t(_isupport.monitor()))
+                                return Error::Ok; // past the limit: not watched here
+                        Vector<String> one;
+                        String         n;
+                        if (n.assign(nick) != Error::Ok || one.append(std::move(n)) != Error::Ok) return Error::NoMem;
+                        monitor('+', one);
+                } else if (_isonAt < 0) {
+                        _isonAt = 0; // the next tick asks
+                }
+                return Error::Ok;
+        }
+
+        void Session::unwatch(Text nick) {
+                for (size_t i = 0; i < _watched.size(); ++i) {
+                        if (!sameName(_watched[i].nick, nick, _isupport.caseMapping())) continue;
+                        if (_watching && _state == State::Registered && _isupport.monitor() >= 0) {
+                                Vector<String> one;
+                                String         n;
+                                if (n.assign(_watched[i].nick) == Error::Ok && one.append(std::move(n)) == Error::Ok)
+                                        monitor('-', one);
+                        }
+                        _watched.removeAt(i);
+                        if (_watched.isEmpty()) _isonAt = -1;
+                        return;
+                }
+                return;
+        }
+
         // ---- Messages
 
         void Session::onMessage(const Message &m, bool notice, const Now &now) {
@@ -651,6 +895,7 @@ namespace irc {
                 }
                 const bool fromMe = isMe(src.nick);
                 const bool service = isService(src.nick);
+                if (!service && ignored(src, now)) return; // CTCP unanswered too
                 if (notice && src.nick.equalsIgnoringCase("NickServ")) {
                         // NickServ answered: the joins wait no longer; a ghosted nick is ours to take.
                         if (_identifying) joinAll();
@@ -661,7 +906,22 @@ namespace irc {
                 Text         body = text;
                 Format::Ctcp ctcp;
                 if (Format::parseCtcp(text, ctcp)) {
-                        if (notice) return; // replies to our requests: none sent but VERSION's own
+                        if (notice) {
+                                // An answer to our request: shown; a PING's with its delay (our clock sent).
+                                if (fromMe) return;
+                                String answer; // as any text: made UTF-8 (Latin-1 read as such)
+                                (void)answer.assign(ctcp.command);
+                                if (!ctcp.args.isEmpty()) {
+                                        (void)answer.append(' ');
+                                        (void)answer.append(ctcp.args);
+                                }
+                                Event         e = make(Event::Kind::CtcpReply, 0, "", src.nick, answer, t);
+                                const int64_t sent = decimal(ctcp.args);
+                                if (ctcp.command.equalsIgnoringCase("PING") && sent >= 0 && sent <= now.mono)
+                                        e.number = now.mono - sent;
+                                emit(std::move(e));
+                                return;
+                        }
                         if (ctcp.command.equalsIgnoringCase("ACTION")) {
                                 flags |= Event::Action;
                                 body = ctcp.args;
@@ -720,16 +980,52 @@ namespace irc {
                         c->joined = true;
                         c->members.clear();
                         c->topic.clear();
+                        c->topicBy.clear();
+                        c->topicAt = 0;
+                        c->modes.clear();
                         c->namesDone = true;
                         (void)_selfUser.assign(src.user);
                         (void)_selfHost.assign(src.host);
                 }
-                if (c != nullptr) addMember(*c, src.nick);
+                if (c != nullptr) {
+                        addMember(*c, src.nick);
+                        if (Member *member = findMember(*c, src.nick); member != nullptr && !src.host.isEmpty()) {
+                                (void)member->host.assign(src.user);
+                                (void)member->host.append('@');
+                                (void)member->host.append(src.host);
+                        }
+                }
                 // extended-join: JOIN #chan account :real name
                 Event e = make(Event::Kind::Join, me ? Event::Self : 0, name, src.nick, m.param(2), timeOf(m, now));
                 if (m.paramCount >= 3 && m.param(1) != Text("*")) (void)e.extra.assign(m.param(1));
                 emit(std::move(e));
                 if (c != nullptr && !me) emit(make(Event::Kind::Members, 0, name, "", "", now.wall));
+                return;
+        }
+
+        // Kicked: back in after a moment, its key kept, once a minute at most (devplan/irc.md §7l).
+        void Session::scheduleRejoin(const Channel &c, const Now &now) {
+                Rejoin *r = nullptr;
+                for (Rejoin &k : _rejoins)
+                        if (sameName(k.name, c.name, _isupport.caseMapping())) r = &k;
+                if (r != nullptr && r->last >= 0 && now.mono - r->last < RejoinOnceMs) return;
+                if (r == nullptr) {
+                        Rejoin fresh;
+                        if (fresh.name.assign(c.name) != Error::Ok || _rejoins.append(std::move(fresh)) != Error::Ok)
+                                return;
+                        r = &_rejoins.last();
+                }
+                r->key.clear();
+                for (const ChannelMode &mode : c.modes)
+                        if (mode.mode == 'k') (void)r->key.assign(mode.param);
+                if (r->key.isEmpty())
+                        for (const String &entry : _config.autojoin) {
+                                const Text   e = entry;
+                                const size_t space = e.find(' ');
+                                if (space != Text::NoPos && sameName(e.left(space), c.name, _isupport.caseMapping()))
+                                        (void)r->key.assign(e.mid(space + 1));
+                        }
+                r->at = now.mono + RejoinAfterMs;
                 return;
         }
 
@@ -754,9 +1050,13 @@ namespace irc {
                                 setting = mode == '+';
                                 continue;
                         }
-                        if (!_isupport.takesParameter(mode, setting)) continue;
-                        const Text param = m.param(next++);
+                        const bool takes = _isupport.takesParameter(mode, setting);
+                        const Text param = takes ? m.param(next++) : Text();
                         const char prefix = _isupport.prefixFor(mode);
+                        if (prefix == 0 && !_isupport.isListMode(mode)) {
+                                setChannelMode(*c, mode, setting, param); // n, t, k key, l 20...
+                                continue;
+                        }
                         if (prefix == 0 || param.isEmpty()) continue;
                         if (Member *member = findMember(*c, param); member != nullptr) {
                                 setPrefix(*member, prefix, setting);
@@ -796,7 +1096,103 @@ namespace irc {
                                         (void)Format::toUtf8(m.last(), c->topic);
                                 emit(make(Event::Kind::Topic, 0, m.param(1), "", m.last(), now.wall));
                                 return;
-                        case 333: return; // who set it, when
+                        case 333: // RPL_TOPICWHOTIME nick #chan setter time
+                                if (Channel *c = findChannel(m.param(1)); c != nullptr) {
+                                        const Text   setter = m.param(2);
+                                        const size_t bang = setter.find('!');
+                                        (void)c->topicBy.assign(bang == Text::NoPos ? setter : setter.left(bang));
+                                        const int64_t at = decimal(m.param(3));
+                                        c->topicAt = at >= 0 ? at * 1000 : 0;
+                                }
+                                return;
+                        case 324: // RPL_CHANNELMODEIS nick #chan +nt-... params
+                                if (Channel *c = findChannel(m.param(1)); c != nullptr) {
+                                        c->modes.clear();
+                                        size_t next = 3;
+                                        for (char mode : m.param(2)) {
+                                                if (mode == '+' || mode == '-') continue;
+                                                const bool takes = _isupport.takesParameter(mode, true);
+                                                setChannelMode(*c, mode, true, takes ? m.param(next++) : Text());
+                                        }
+                                        emit(make(Event::Kind::ChannelModes, 0, c->name, "", "", now.wall));
+                                }
+                                return;
+                        case 329: return; // RPL_CREATIONTIME
+                        case 321: emit(make(Event::Kind::ListStart, Event::Server, "", "", "", now.wall)); return;
+                        case 322: { // RPL_LIST nick #chan users :topic
+                                Event e = make(Event::Kind::ListEntry, Event::Server, m.param(1), "", m.param(3),
+                                               now.wall);
+                                const int64_t users = decimal(m.param(2));
+                                e.number = users >= 0 ? users : 0;
+                                emit(std::move(e));
+                                return;
+                        }
+                        case 323: emit(make(Event::Kind::ListEnd, Event::Server, "", "", "", now.wall)); return;
+                        case 263: // RPL_TRYAGAIN nick LIST :Please wait a while and try again.
+                        case 416: // ERR_TOOMANYMATCHES nick LIST :Output too large
+                                if (m.param(1).equalsIgnoringCase("LIST")) {
+                                        emit(make(Event::Kind::ListEnd, Event::Server, "", "", m.last(), now.wall));
+                                        return;
+                                }
+                                break;
+                        case 367:   // RPL_BANLIST nick #chan mask [setter time]
+                        case 348:   // RPL_EXCEPTLIST
+                        case 346: { // RPL_INVITELIST
+                                Event e = make(Event::Kind::ModeListEntry, Event::Server, m.param(1), m.param(3),
+                                               m.param(2), now.wall);
+                                (void)e.extra.assign(numeric == 367 ? "b" : numeric == 348 ? "e" : "I");
+                                const size_t bang = e.nick.view().find('!');
+                                if (bang != Text::NoPos) {
+                                        String nick;
+                                        (void)nick.assign(e.nick.view().left(bang));
+                                        e.nick = std::move(nick);
+                                }
+                                const int64_t at = decimal(m.param(4));
+                                e.number = at >= 0 ? at : 0;
+                                emit(std::move(e));
+                                return;
+                        }
+                        case 368: // RPL_ENDOFBANLIST nick #chan :End
+                        case 349:
+                        case 347: {
+                                Event e = make(Event::Kind::ModeListEnd, Event::Server, m.param(1), "", "", now.wall);
+                                (void)e.extra.assign(numeric == 368 ? "b" : numeric == 349 ? "e" : "I");
+                                emit(std::move(e));
+                                return;
+                        }
+                        case 730:   // RPL_MONONLINE nick :a!u@h,b!u@h
+                        case 731: { // RPL_MONOFFLINE nick :a,b
+                                Text list = m.last();
+                                while (!list.isEmpty()) {
+                                        size_t comma = list.find(',');
+                                        if (comma == Text::NoPos) comma = list.size();
+                                        const Text   item = list.left(comma);
+                                        const size_t bang = item.find('!');
+                                        setOnline(bang == Text::NoPos ? item : item.left(bang), numeric == 730,
+                                                  bang == Text::NoPos ? Text() : item.mid(bang + 1), now);
+                                        list = list.mid(comma + 1);
+                                }
+                                return;
+                        }
+                        case 732: // RPL_MONLIST, RPL_ENDOFMONLIST
+                        case 733: return;
+                        case 303: {                              // RPL_ISON nick :a b
+                                if (_isonAsked.isEmpty()) break; // a /ison typed: shown
+                                Vector<String> asked = std::move(_isonAsked);
+                                _isonAsked.clear();
+                                for (const String &nick : asked) {
+                                        bool on = false;
+                                        eachWord(m.last(), [&](Text w) {
+                                                if (sameName(w, nick, _isupport.caseMapping())) on = true;
+                                        });
+                                        setOnline(nick, on, Text(), now);
+                                }
+                                return;
+                        }
+                        case 376: // RPL_ENDOFMOTD, ERR_NOMOTD: registration's burst done, ISUPPORT known
+                        case 422:
+                                if (!_watching) startWatching(now);
+                                break;
                         case 353: {       // RPL_NAMREPLY nick = #chan :@a +b c
                                 Channel *c = findChannel(m.param(2));
                                 if (c == nullptr) return;
@@ -919,6 +1315,44 @@ namespace irc {
                 if (hasBreak(reason)) return Error::Malformed;
                 const Text p[] = {reason};
                 send(Kind::Priority, "QUIT", p, reason.isEmpty() ? 0 : 1, true);
+                return Error::Ok;
+        }
+
+        Error Session::ctcp(Text target, Text command, Text args, const Now &now) {
+                if (!isName(target) || !isName(command) || hasBreak(args)) return Error::Malformed;
+                String body;
+                (void)body.append('\x01');
+                for (char c : command) (void)body.append(c >= 'a' && c <= 'z' ? char(c - 32) : c);
+                if (!args.isEmpty() || command.equalsIgnoringCase("PING")) {
+                        (void)body.append(' ');
+                        if (args.isEmpty())
+                                appendDecimal(body, now.mono); // its answer's delay (CtcpReply's number)
+                        else
+                                (void)body.append(args);
+                }
+                if (body.append('\x01') != Error::Ok) return Error::NoMem;
+                if (body.size() > 400) return Error::TooLong;
+                const Text p[] = {target, body};
+                send(Kind::User, "PRIVMSG", p, 2, true);
+                return Error::Ok;
+        }
+
+        Error Session::list(uint32_t minUsers, uint32_t maxUsers) {
+                // ELIST U: >n (more than n users), <n (fewer); the rest the caller filters.
+                String     conditions;
+                const bool users =
+                        _isupport.elist().find('U') != Text::NoPos || _isupport.elist().find('u') != Text::NoPos;
+                if (users && minUsers > 1) {
+                        (void)conditions.append('>');
+                        appendDecimal(conditions, int64_t(minUsers) - 1);
+                }
+                if (users && maxUsers > 0) {
+                        if (!conditions.isEmpty()) (void)conditions.append(',');
+                        (void)conditions.append('<');
+                        appendDecimal(conditions, int64_t(maxUsers) + 1);
+                }
+                const Text p[] = {conditions};
+                send(Kind::User, "LIST", p, conditions.isEmpty() ? 0 : 1, false);
                 return Error::Ok;
         }
 

@@ -16,16 +16,22 @@
 #   6697  TLS        6667  plain TCP
 #
 # What it speaks: CAP LS 302 / REQ / END (sasl=PLAIN, server-time, message-tags, echo-message,
-# multi-prefix, away-notify, extended-join, account-notify, cap-notify, chghost), SASL PLAIN
-# against the --account list, NICK (433 when taken), USER, PING/PONG, JOIN, PART, PRIVMSG,
-# NOTICE, TOPIC, NAMES, MODE (+o +v), AWAY, WHOIS, QUIT; 001-005, the MOTD.
+# multi-prefix, away-notify, extended-join, account-notify, cap-notify, chghost,
+# userhost-in-names), SASL PLAIN against the --account list, NICK (433 when taken), USER,
+# PING/PONG, JOIN, PART, KICK, INVITE, PRIVMSG, NOTICE, TOPIC (333: who, when), NAMES, MODE (+o +v;
+# the channel's i m n p s t, k key, l limit; the b, e and I lists: 367/368, 348/349, 346/347),
+# AWAY, WHOIS, LIST (with ELIST=U: >n, <n; --channels made-up channels besides the real ones),
+# MONITOR (+ - C L S; 730/731 as people come and go; --no-monitor: without, for ISON), ISON,
+# QUIT; 001-005, the MOTD.
 # NickServ: IDENTIFY [account] password (900 and a notice), REGISTER password email (with
 # --verify-code, a code "mailed": VERIFY REGISTER nick code), GHOST nick password.
 # A bot, alice, in #bmds: a line every --chatter seconds, some of them mentioning whoever is
 # there; bob joins and parts now and then.
 # TestServ, for the board's tests: "KILL" closes your connection, "SILENT n" stops answering
 # your PINGs for n seconds, "FLOOD n" sends you n lines in #bmds at once, "QUERY" has alice send you
-# a private message.
+# a private message, "KICKME" has alice kick you from #bmds, "INVITE" has alice invite you to #fun,
+# "BOB" has bob quit or come back (MONITOR's and ISON's tests), "LISTWAIT" refuses your next LIST
+# (263). alice answers CTCP VERSION, PING and TIME.
 #
 # Python's standard library and the openssl command only.
 
@@ -43,7 +49,8 @@ import tempfile
 import time
 
 CAPS = ["sasl=PLAIN", "server-time", "message-tags", "echo-message", "multi-prefix", "away-notify",
-        "extended-join", "account-notify", "cap-notify", "chghost"]
+        "extended-join", "account-notify", "cap-notify", "chghost", "userhost-in-names"]
+MONITOR_LIMIT = 100
 SERVER = "irc.test"
 
 
@@ -86,6 +93,8 @@ class Client:
                 self.account, self.away, self.host = None, None, "user/test"
                 self.silent_until = 0
                 self.sasl = False
+                self.monitor = set()     # folded nicks watched
+                self.list_refused = False
 
         def source(self):
                 return "%s!%s@%s" % (self.nick, self.user or "u", self.host)
@@ -224,8 +233,12 @@ class Client:
                 self.reply("002", "Your host is %s" % SERVER)
                 self.reply("003", "This server was created for BMDS's tests")
                 self.reply("004", SERVER, "test-1", "i", "bklmnopstv", "This server's modes")
-                self.reply("005", "CASEMAPPING=rfc1459", "CHANTYPES=#", "NETWORK=TestNet", "PREFIX=(ov)@+",
-                           "CHANMODES=b,k,l,imnpst", "are supported by this server")
+                tokens = ["CASEMAPPING=rfc1459", "CHANTYPES=#", "NETWORK=TestNet", "PREFIX=(ov)@+",
+                          "CHANMODES=beI,k,l,imnpst", "ELIST=U", "MODES=4"]
+                if self.server.monitor:
+                        tokens.append("MONITOR=%d" % MONITOR_LIMIT)
+                self.reply("005", *tokens, "are supported by this server")
+                self.server.came(self)
                 self.reply("375", "- %s Message of the day -" % SERVER)
                 self.reply("372", "- A test server: nothing here is kept.")
                 self.reply("376", "End of /MOTD command.")
@@ -265,9 +278,13 @@ class Client:
                 if ch is None:
                         self.reply("403", args[0] if args else "*", "No such channel")
                 elif len(args) == 1:
-                        self.reply("332", ch["name"], ch["topic"]) if ch["topic"] else self.reply("331", ch["name"], "No topic")
+                        if ch["topic"]:
+                                self.reply("332", ch["name"], ch["topic"])
+                                self.send(":%s 333 %s %s %s %d" % (SERVER, self.nick, ch["name"], ch["topic_by"], ch["topic_at"]))
+                        else:
+                                self.reply("331", ch["name"], "No topic")
                 else:
-                        ch["topic"] = args[1]
+                        ch["topic"], ch["topic_by"], ch["topic_at"] = args[1], self.source(), int(time.time())
                         for c in ch["members"]:
                                 c.send(":%s TOPIC %s :%s" % (self.source(), ch["name"], args[1]))
 
@@ -284,13 +301,55 @@ class Client:
                         if fold(args[0]) == fold(self.nick or ""):
                                 self.send(":%s MODE %s :%s" % (self.nick, self.nick, args[1] if len(args) > 1 else "+i"))
                         return
+                modes = ch["modes"]
                 if len(args) == 1:
-                        self.reply("324", ch["name"], "+nt", "the modes")
+                        flags = "".join(sorted(m for m in modes if m in "imnpst")) + "".join(m for m in "kl" if m in modes)
+                        params = "".join(" " + modes[m] for m in "kl" if m in modes)
+                        self.send(":%s 324 %s %s +%s%s" % (SERVER, self.nick, ch["name"], flags, params))
+                        return
+                lists = {"b": ("367", "368", "Ban"), "e": ("348", "349", "Exception"), "I": ("346", "347", "Invite")}
+                if len(args) == 2 and args[1].lstrip("+") in lists:
+                        m = args[1].lstrip("+")
+                        item, end, what = lists[m]
+                        for mask, setter, at in ch["lists"][m]:
+                                self.send(":%s %s %s %s %s %s %d" % (SERVER, item, self.nick, ch["name"], mask, setter, at))
+                        self.reply(end, ch["name"], "End of Channel %s List" % what)
                         return
                 sign, at, changes = "+", 2, []
                 for m in args[1]:
                         if m in "+-":
                                 sign = m
+                                continue
+                        if m in lists and at < len(args):
+                                mask = args[at]
+                                at += 1
+                                entries = ch["lists"][m]
+                                present = [e for e in entries if e[0] == mask]
+                                if sign == "+" and not present:
+                                        entries.append((mask, self.source(), int(time.time())))
+                                        changes.append((sign + m, mask))
+                                elif sign == "-" and present:
+                                        entries.remove(present[0])
+                                        changes.append((sign + m, mask))
+                                continue
+                        if m in "kl":
+                                if sign == "+" and at < len(args):
+                                        modes[m] = args[at]
+                                        changes.append((sign + m, args[at]))
+                                        at += 1
+                                elif sign == "-" and m in modes:
+                                        if m == "k" and at < len(args):
+                                                at += 1
+                                        del modes[m]
+                                        changes.append((sign + m, ""))
+                                continue
+                        if m in "imnpst":
+                                if (sign == "+") != (m in modes):
+                                        if sign == "+":
+                                                modes[m] = ""
+                                        else:
+                                                del modes[m]
+                                        changes.append((sign + m, ""))
                                 continue
                         if m in "ov" and at < len(args):
                                 target = self.server.users.get(fold(args[at]))
@@ -301,9 +360,9 @@ class Client:
                                         ch["members"][target] = (prefixes + p if sign == "+" and p not in prefixes
                                                                  else prefixes.replace(p, "") if sign == "-" else prefixes)
                                         changes.append((sign + m, target.nick))
-                for change, nick in changes:
+                for change, param in changes:
                         for c in ch["members"]:
-                                c.send(":%s MODE %s %s %s" % (self.source(), ch["name"], change, nick))
+                                c.send((":%s MODE %s %s %s" % (self.source(), ch["name"], change, param)).rstrip())
 
         def on_away(self, args):
                 self.away = args[-1] if args and args[-1] else None
@@ -322,6 +381,80 @@ class Client:
                         if who.account:
                                 self.reply("330", who.nick, who.account, "is logged in as")
                 self.reply("318", args[-1] if args else "*", "End of /WHOIS list")
+
+        def on_kick(self, args):
+                ch = self.server.channel(args[0]) if args else None
+                who = self.server.users.get(fold(args[1])) if len(args) >= 2 else None
+                if ch is None or who not in (ch["members"] if ch else {}):
+                        self.reply("441", args[1] if len(args) >= 2 else "*", args[0] if args else "*", "They aren't on that channel")
+                        return
+                self.server.kick(self, ch, who, args[2] if len(args) >= 3 else self.nick)
+
+        def on_invite(self, args):
+                who = self.server.users.get(fold(args[0])) if len(args) >= 2 else None
+                if who is None:
+                        self.reply("401", args[0] if args else "*", "No such nick")
+                        return
+                self.reply("341", who.nick, args[1], "Inviting")
+                who.send(":%s INVITE %s %s" % (self.source(), who.nick, args[1]))
+
+        def on_list(self, args):
+                if self.list_refused:
+                        self.list_refused = False
+                        self.reply("263", "LIST", "Please wait a while and try again.")
+                        return
+                least, most = 0, 1 << 30
+                for cond in (args[0].split(",") if args else []):
+                        if cond.startswith(">") and cond[1:].isdigit():
+                                least = int(cond[1:]) + 1
+                        elif cond.startswith("<") and cond[1:].isdigit():
+                                most = int(cond[1:]) - 1
+                self.reply("321", "Channel", "Users  Name")
+                real = [(ch["name"], len(ch["members"]), ch["topic"]) for ch in self.server.channels.values()]
+                for name, users, topic in real + self.server.fake_channels:
+                        if least <= users <= most:
+                                self.send(":%s 322 %s %s %d :%s" % (SERVER, self.nick, name, users, topic))
+                self.reply("323", "End of /LIST")
+
+        def on_monitor(self, args):
+                if not self.server.monitor:
+                        self.reply("421", "MONITOR", "Unknown command")
+                        return
+                sub = args[0] if args else ""
+                nicks = [n for n in (args[1].split(",") if len(args) >= 2 else []) if n]
+                if sub == "+":
+                        on, off = [], []
+                        for n in nicks:
+                                if len(self.monitor) >= MONITOR_LIMIT:
+                                        self.reply("734", str(MONITOR_LIMIT), n, "Monitor list is full.")
+                                        break
+                                self.monitor.add(fold(n))
+                                who = self.server.users.get(fold(n))
+                                (on.append(who.source()) if who else off.append(n))
+                        if on:
+                                self.reply("730", ",".join(on))
+                        if off:
+                                self.reply("731", ",".join(off))
+                elif sub == "-":
+                        for n in nicks:
+                                self.monitor.discard(fold(n))
+                elif sub == "C":
+                        self.monitor.clear()
+                elif sub == "L":
+                        if self.monitor:
+                                self.reply("732", ",".join(sorted(self.monitor)))
+                        self.reply("733", "End of MONITOR list")
+                elif sub == "S":
+                        on = [self.server.users[n].source() for n in sorted(self.monitor) if n in self.server.users]
+                        off = [n for n in sorted(self.monitor) if n not in self.server.users]
+                        if on:
+                                self.reply("730", ",".join(on))
+                        if off:
+                                self.reply("731", ",".join(off))
+
+        def on_ison(self, args):
+                words = " ".join(args).split()
+                self.reply("303", " ".join(self.server.users[fold(w)].nick for w in words if fold(w) in self.server.users))
 
         # Messages
         def on_privmsg(self, args, notice=False):
@@ -349,6 +482,16 @@ class Client:
                 if other is None:
                         self.reply("401", target, "No such nick")
                         return
+                if isinstance(other, Bot) and not notice and text.startswith("\x01") and text.endswith("\x01"):
+                        # A bot's CTCP answers: VERSION, PING (its argument back), TIME.
+                        words = text.strip("\x01").split(" ", 1)
+                        what = words[0].upper()
+                        answer = {"VERSION": "VERSION irc-test-server bot",
+                                  "PING": "PING " + (words[1] if len(words) > 1 else ""),
+                                  "TIME": "TIME " + time.strftime("%a %b %d %H:%M:%S %Y", time.gmtime())}.get(what)
+                        if answer:
+                                self.send(":%s NOTICE %s :\x01%s\x01" % (other.source(), self.nick, answer))
+                        return
                 other.send(":%s %s %s :%s" % (self.source(), cmd, other.nick, text))
                 if "echo-message" in self.caps:
                         self.send(":%s %s %s :%s" % (self.source(), cmd, other.nick, text))
@@ -373,15 +516,51 @@ class Bot:
 
 
 class Server:
-        def __init__(self, accounts, verbose, verify_code=None):
+        def __init__(self, accounts, verbose, verify_code=None, monitor=True, channels=2000):
                 self.users, self.channels, self.accounts, self.verbose = {}, {}, accounts, verbose
                 self.verify_code, self.unverified = verify_code, set()
+                self.monitor = monitor
+                self.fake_channels = self.make_channels(channels)
                 self.alice = Bot(self, "alice", "Alice the bot")
                 self.bob = Bot(self, "bob", "Bob the bot")
                 self.users["alice"] = self.alice
                 self.join(self.alice, "#bmds")
                 self.channel("#bmds")["members"][self.alice] = "@"
                 self.channel("#bmds")["topic"] = "BMDS, an OS for the ESP32-P4 | https://github.com/jthwho/bmds"
+                self.channel("#bmds")["topic_by"] = self.alice.source()
+                self.channel("#bmds")["topic_at"] = int(time.time())
+                self.channel("#bmds")["lists"]["b"].append(("*!*@spam.example", self.alice.source(), int(time.time())))
+
+        @staticmethod
+        def make_channels(count):
+                """Made-up channels for LIST: most with one or two people, a few big; some topics coloured."""
+                rng = random.Random(6697)
+                words = ["linux", "retro", "esp32", "music", "chess", "python", "radio", "art", "games", "help",
+                         "news", "space", "bikes", "coffee", "books", "math", "rust", "c", "cpp", "bmds"]
+                out = []
+                for i in range(count):
+                        name = "#%s-%s%d" % (rng.choice(words), rng.choice(words), i)
+                        users = 1 + int(rng.paretovariate(1.2)) - 1 if rng.random() < 0.8 else rng.randint(3, 400)
+                        topic = rng.choice(["", "Welcome to %s" % name, "\x02%s\x02 talk | be nice" % name[1:],
+                                            "\x0304red\x03 and \x0312blue\x03 things, rules at https://example.com/"])
+                        out.append((name, users, topic))
+                return out
+
+        def came(self, client):
+                """Registered: those watching them told (MONITOR)."""
+                for c in list(self.users.values()):
+                        if isinstance(c, Client) and c is not client and fold(client.nick) in c.monitor:
+                                c.reply("730", client.source())
+
+        def went(self, nick):
+                for c in list(self.users.values()):
+                        if isinstance(c, Client) and fold(nick) in c.monitor:
+                                c.reply("731", nick)
+
+        def kick(self, by, ch, who, reason):
+                for c in ch["members"]:
+                        c.send(":%s KICK %s %s :%s" % (by.source(), ch["name"], who.nick, reason))
+                del ch["members"][who]
 
         def log(self, text):
                 if self.verbose:
@@ -400,18 +579,25 @@ class Server:
                 return seen
 
         def rename(self, client, nick):
+                old = client.nick
                 self.users.pop(fold(client.nick), None)
                 client.nick = nick
                 self.users[fold(nick)] = client
+                if old and client.registered:
+                        self.went(old)
+                        self.came(client)
 
         def names(self, client, ch):
                 multi = "multi-prefix" in client.caps
-                items = [(p if multi else p[:1]) + c.nick for c, p in ch["members"].items()]
+                hosts = "userhost-in-names" in client.caps
+                items = [(p if multi else p[:1]) + (c.source() if hosts else c.nick) for c, p in ch["members"].items()]
                 client.reply("353", "=", ch["name"], " ".join(items))
                 client.reply("366", ch["name"], "End of /NAMES list.")
 
         def join(self, client, name):
-                ch = self.channels.setdefault(fold(name), {"name": name, "topic": "", "members": {}})
+                ch = self.channels.setdefault(fold(name), {"name": name, "topic": "", "topic_by": SERVER, "topic_at": 0,
+                                                           "members": {}, "modes": {"n": "", "t": ""},
+                                                           "lists": {"b": [], "e": [], "I": []}})
                 if client in ch["members"]:
                         return
                 ch["members"][client] = ""
@@ -423,6 +609,7 @@ class Server:
                 if isinstance(client, Client):
                         if ch["topic"]:
                                 client.reply("332", ch["name"], ch["topic"])
+                                client.send(":%s 333 %s %s %s %d" % (SERVER, client.nick, ch["name"], ch["topic_by"], ch["topic_at"]))
                         self.names(client, ch)
 
         def part(self, client, name, reason):
@@ -442,6 +629,7 @@ class Server:
                 for ch in self.channels.values():
                         ch["members"].pop(client, None)
                 self.users.pop(fold(client.nick), None)
+                self.went(client.nick)
                 self.log("-- %s gone: %s" % (client.nick, reason))
 
         def notice_from(self, who, client, text):
@@ -513,8 +701,26 @@ class Server:
                 elif cmd == "FLOOD" and len(words) >= 2:
                         for i in range(int(words[1])):
                                 client.send(":%s PRIVMSG #bmds :flood line %d of %s" % (self.alice.source(), i + 1, words[1]))
+                elif cmd == "KICKME":
+                        ch = self.channel("#bmds")
+                        if ch is not None and client in ch["members"]:
+                                self.kick(self.alice, ch, client, "TestServ asked")
+                elif cmd == "INVITE":
+                        client.send(":%s INVITE %s #fun" % (self.alice.source(), client.nick))
+                elif cmd == "BOB":
+                        if self.users.get("bob") is self.bob:
+                                self.gone(self.bob, "Quit: off for a bit")
+                                self.notice_from(ts, client, "bob quit.")
+                        else:
+                                self.users["bob"] = self.bob
+                                self.came(self.bob)
+                                self.join(self.bob, "#bmds")
+                                self.notice_from(ts, client, "bob is back.")
+                elif cmd == "LISTWAIT":
+                        client.list_refused = True
+                        self.notice_from(ts, client, "Your next LIST is refused.")
                 else:
-                        self.notice_from(ts, client, "KILL, SILENT seconds, FLOOD lines, QUERY")
+                        self.notice_from(ts, client, "KILL, SILENT seconds, FLOOD lines, QUERY, KICKME, INVITE, BOB, LISTWAIT")
 
         def say(self, bot, channel, text):
                 ch = self.channel(channel)
@@ -538,8 +744,7 @@ class Server:
                         if n % 5 == 0:
                                 if self.bob in self.channel("#bmds")["members"]:
                                         self.part(self.bob, "#bmds", "later")
-                                else:
-                                        self.users["bob"] = self.bob
+                                elif self.users.get("bob") is self.bob:
                                         self.join(self.bob, "#bmds")
                         elif n % 3 == 0:
                                 self.say(self.alice, "#bmds", "%s: what do you think?" % random.choice(people).nick)
@@ -555,6 +760,8 @@ async def main():
         parser.add_argument("--chatter", type=float, default=8.0, help="seconds between alice's lines (0: none)")
         parser.add_argument("--verbose", action="store_true", help="print every line received")
         parser.add_argument("--verify-code", help="REGISTER mails this code (VERIFY REGISTER nick CODE)")
+        parser.add_argument("--channels", type=int, default=2000, help="made-up channels LIST shows besides the real ones")
+        parser.add_argument("--no-monitor", action="store_true", help="no MONITOR (the client watches with ISON)")
         args = parser.parse_args()
         accounts = dict(a.split(":", 1) for a in args.account)
         work = tempfile.mkdtemp(prefix="irc-test-server-", dir=os.path.expanduser("~/.cache"))
@@ -564,7 +771,7 @@ async def main():
                 shutil.copy(os.path.join(work, "ca.pem"), os.path.join(args.out, "ca.pem"))
                 context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
                 context.load_cert_chain(os.path.join(work, "server.pem"), os.path.join(work, "server.key"))
-                server = Server(accounts, args.verbose, args.verify_code)
+                server = Server(accounts, args.verbose, args.verify_code, not args.no_monitor, args.channels)
 
                 def serve(secure):
                         async def handler(reader, writer):

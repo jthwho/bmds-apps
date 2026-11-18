@@ -20,6 +20,7 @@
 #include "commands.h"
 #include "complete.h"
 #include "format.h"
+#include "ignore.h"
 #include "session.h"
 
 #include <cstdint>
@@ -35,6 +36,7 @@ namespace {
         }
 
         void drain(irc::Session &s, irc::Buffers &buffers, const irc::Now &now) {
+                bool        perform = false;
                 irc::String line;
                 while (s.takeLine(now.mono, line)) {
                         const Text l = line;
@@ -48,6 +50,20 @@ namespace {
                         irc::Vector<irc::Line> lines;
                         (void)buffers.apply(e, s, lines);
                         for (const irc::Line &l : lines) check(buffers.byId(l.buffer) != nullptr);
+                        if (e.kind == irc::Event::Kind::Perform) perform = true;
+                }
+                if (perform) {
+                        // As the app: each line made a command and run, then the joins.
+                        for (const irc::String &p : s.config().perform) {
+                                irc::String            command;
+                                irc::Vector<irc::Line> lines;
+                                irc::Outcome           outcome;
+                                if (irc::performLine(p, s.nick(), command) == irc::Error::Ok)
+                                        (void)irc::runCommand(command, s, buffers, buffers.network().id, now, lines,
+                                                              outcome);
+                        }
+                        s.performed();
+                        drain(s, buffers, now);
                 }
                 return;
         }
@@ -62,7 +78,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         irc::String join;
         (void)join.assign("#bmds");
         (void)c.autojoin.append(std::move(join));
+        if (size > 0 && (data[0] & 2)) {
+                irc::String p;
+                (void)p.assign("mode $me +x");
+                (void)c.perform.append(std::move(p));
+        }
+        c.rejoin = size > 0 && (data[0] & 4);
+        c.joinInvited = size > 0 && (data[0] & 8);
+        irc::Ignores ignores;
+        (void)ignores.read("spam!*@*, *!*@bad.*@TestNet");
         irc::Session   s(std::move(c));
+        s.setIgnores(&ignores, "TestNet");
+        (void)s.watch("alice");
         irc::Buffers   buffers;
         irc::Completer completer;
         irc::Now       now{1000, 1000};
@@ -79,7 +106,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 at = end + 1;
                 if (line.isEmpty()) continue;
                 // The first byte: 0x01 the user types the rest (in the buffer its next byte picks),
-                // 0x02 time passes, 0x03 the connection goes and comes back, 0x04 Tab on the rest;
+                // 0x02 time passes, 0x03 the connection goes and comes back, 0x04 Tab on the rest,
+                // 0x05 the rest the ignore list, 0x06 the rest watched (or no longer, if it was);
                 // anything else the server's line.
                 const Text rest = line.mid(1);
                 switch (line[0]) {
@@ -94,9 +122,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                                 if (outcome.action == irc::Outcome::Action::Close) {
                                         buffers.close(outcome.buffer);
                                         current = buffers.network().id;
+                                } else if (outcome.action == irc::Outcome::Action::Ignore && !outcome.text.isEmpty()) {
+                                        if (outcome.on)
+                                                (void)ignores.add(outcome.text, outcome.extra);
+                                        else
+                                                (void)ignores.remove(outcome.text, outcome.extra);
+                                } else if (outcome.action == irc::Outcome::Action::Notify && !outcome.text.isEmpty()) {
+                                        if (outcome.on)
+                                                (void)s.watch(outcome.text);
+                                        else
+                                                s.unwatch(outcome.text);
                                 }
                                 break;
                         }
+                        case '\x05': {
+                                (void)ignores.read(rest);
+                                irc::String out;
+                                (void)ignores.write(out);
+                                break;
+                        }
+                        case '\x06':
+                                if (s.online(rest) != -1 || s.watch(rest) != irc::Error::Ok) s.unwatch(rest);
+                                break;
                         case '\x04': {
                                 irc::String text;
                                 (void)text.assign(rest);

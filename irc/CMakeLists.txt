@@ -6,7 +6,7 @@
 set(IRC_VERSION 0.1.0)
 
 add_library(irc_core STATIC core/message.cpp core/str.cpp core/isupport.cpp core/format.cpp core/session.cpp
-            core/buffers.cpp core/commands.cpp core/complete.cpp core/settings.cpp)
+            core/buffers.cpp core/commands.cpp core/complete.cpp core/settings.cpp core/ignore.cpp)
 target_include_directories(irc_core PUBLIC core)
 target_link_libraries(irc_core PUBLIC bmds_headers)
 target_compile_options(irc_core PRIVATE -Os -Wall -Wextra -Werror)
@@ -17,7 +17,7 @@ target_link_libraries(irc PRIVATE irc_core)
 target_compile_options(irc PRIVATE -Os -Wall -Wextra -Werror)
 
 # apps/irc.app: the program and its desktop entry.
-bmds_add_app(irc PROGRAM irc DESKTOP app.desktop)
+bmds_add_app(irc PROGRAM irc DESKTOP app.desktop FILES servers.ini)
 
 bmds_add_package(irc VERSION ${IRC_VERSION}
         SUMMARY "Chat on IRC networks, over TLS"

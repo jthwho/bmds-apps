@@ -114,7 +114,20 @@ namespace irc {
                 String path, text;
                 inData(path, _dataDir, "networks.ini");
                 if (!readFile(CString(path).c(), text)) {
-                        (void)text.assign(FirstNetworks);
+                        // A first start: the networks the shipped list offers (devplan/irc.md §7c);
+                        // without the list (not run from its folder), the comment alone.
+                        Vector<ServerEntry> servers;
+                        Vector<String>      ignoredProblems;
+                        String              list;
+                        const char         *appDir = bmds_app_dir();
+                        if (appDir != nullptr) {
+                                String serversPath;
+                                (void)serversPath.assign(appDir);
+                                (void)serversPath.append("/servers.ini");
+                                if (readFile(CString(serversPath).c(), list))
+                                        (void)readServers(list, servers, ignoredProblems);
+                        }
+                        if (firstNetworks(servers, text) != Error::Ok) (void)text.assign(NetworksComment);
                         (void)writeFile(CString(path).c(), text);
                 }
                 Vector<NetworkSettings> nets;
@@ -488,6 +501,20 @@ namespace irc {
                         case Event::Kind::Timeout: disconnect(n, "no answer from the server", true); break;
                         case Event::Kind::Notice: registration(n, e); break;
                         case Event::Kind::Lag: updateStatus(); break;
+                        case Event::Kind::Perform: {
+                                // Perform's lines (devplan/irc.md §7f) in the network's buffer, then the joins.
+                                for (const String &line : net.session.config().perform) {
+                                        String command;
+                                        if (performLine(line, net.session.nick(), command) != Error::Ok) continue;
+                                        Vector<Line> lines;
+                                        Outcome      outcome;
+                                        (void)runCommand(command, net.session, net.buffers, net.buffers.network().id,
+                                                         now(), lines, outcome);
+                                        show(n, lines);
+                                }
+                                net.session.performed();
+                                break;
+                        }
                         default: break;
                 }
                 return;
@@ -991,6 +1018,7 @@ namespace irc {
                                         }
                                 break;
                         case Outcome::Action::Quit: net.wanted = false; break;
+                        default: break; // the list, Find, ignores, notify, /server: step 5c
                 }
                 pump(p.network);
                 return;

@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "ignore.h"
 #include "isupport.h"
 #include "message.h"
 #include "str.h"
@@ -44,19 +45,32 @@ namespace irc {
                         String         password; ///< SASL PLAIN's, NickServ's, or the server's.
                         Vector<String> autojoin; ///< Channels joined once registered (and logged in).
                         String         version;  ///< CTCP VERSION's answer.
+                        Vector<String> perform;  ///< Lines run once registered, before the joins (§7f).
+                        bool           rejoin = false;      ///< Kicked: joined again after 3 s (§7l).
+                        bool           joinInvited = false; ///< Invited: joined (§7l).
         };
 
         /** @brief A member of a channel: a nick and its prefixes (`@+`, highest first). */
         struct Member {
                         String nick;
+                        String host; ///< `user@host` when known (their join, userhost-in-names).
                         char   prefixes[8] = {};
                         bool   away = false;
+        };
+
+        /** @brief A channel's mode that isn't a list or a member's (`n`, `t`; `k` and `l` with theirs). */
+        struct ChannelMode {
+                        char   mode = 0;
+                        String param;
         };
 
         /** @brief A channel the session is in (or was in, when the connection went: rejoined). */
         struct Channel {
                         String         name;
                         String         topic;
+                        String              topicBy;     ///< Who set it (`333`, or a `TOPIC` seen).
+                        int64_t             topicAt = 0; ///< When (ms since 1970; 0: not known).
+                        Vector<ChannelMode> modes;       ///< As `324` and `MODE` say.
                         Vector<Member> members;
                         bool           joined = false;
                         bool           namesDone = true; ///< The last NAMES ended (the next 353 starts afresh).
@@ -81,8 +95,19 @@ namespace irc {
                                 LoginFailed, ///< text: why.
                                 Error,       ///< text: the server's ERROR (the connection ends).
                                 Timeout,     ///< Nothing heard for too long: the connection is to be dropped.
-                                Invite,      ///< nick invited us to text.
+                                Invite,      ///< nick invited us to text (extra "joining": we join it).
                                 Lag,         ///< number: the ms a PING took.
+                                Perform,     ///< Time to run `Config::perform`, then `performed()` (§7f).
+                                ListStart,   ///< A channel list begins (`321`).
+                                ListEntry,   ///< target a channel, number its users, text its topic (`322`).
+                                ListEnd,     ///< The list ended; text: why it was refused (empty: done).
+                                ModeListEntry, ///< target the channel, extra the mode (b, e, I), text the mask, nick who set it, number when (s).
+                                ModeListEnd,  ///< target the channel, extra the mode.
+                                ChannelModes, ///< target: its modes as the server says them (`324`).
+                                Online,       ///< nick (watched: §7g) is on; extra their user@host if said.
+                                Offline,      ///< nick (watched, seen on) is gone.
+                                CtcpReply, ///< nick answered a CTCP: text the command and answer; number a PING's ms.
+                                Ignored,   ///< number: messages dropped from people ignored (at most once a minute).
                         };
                         enum Flag : uint8_t {
                                 Self = 1,    ///< We did it (our own message, join, nick change).
@@ -131,6 +156,13 @@ namespace irc {
                         static constexpr int64_t IdentifyWaitMs = 10000;
                         /** @brief How long after a GHOST before the nick is taken again. */
                         static constexpr int64_t RegainWaitMs = 2000;
+                        /** @brief Without MONITOR: ISON this often while anyone is watched. */
+                        static constexpr int64_t IsonEveryMs = 60000;
+                        /** @brief Kicked, with `rejoin`: joined again this long after, at most once a `RejoinOnceMs`. */
+                        static constexpr int64_t RejoinAfterMs = 3000;
+                        static constexpr int64_t RejoinOnceMs = 60000;
+                        /** @brief Messages ignored are counted, told this long after the first. */
+                        static constexpr int64_t IgnoredEveryMs = 60000;
 
                         explicit Session(Config &&config) : _config(std::move(config)) {}
 
@@ -178,6 +210,22 @@ namespace irc {
                         /** @brief Returns the channel named @p name (casemapped), or null. */
                         const Channel *channel(Text name) const;
 
+                        /** @brief Returns @p nick's `user@host` from any channel shared, or empty. */
+                        Text hostOf(Text nick) const;
+
+                        /** @brief Returns @p nick's state when watched: 1 on, 0 off, -1 not known (or not watched). */
+                        int online(Text nick) const;
+
+                        /**
+                         * @brief Drops what people matching @p ignores send (messages, notices, CTCP,
+                         *        invites) on network @p network (its name in the settings), counted
+                         *        (`Ignored`). @p ignores is the caller's and outlives the session (null: none).
+                         */
+                        void setIgnores(const Ignores *ignores, Text network);
+
+                        /** @brief The `Perform` lines have run: the joins go (§7f). */
+                        void performed();
+
                         /** @name What the user does (`Malformed`: a CR, LF or NUL in it, or no target) */
                         ///@{
                         /** @brief A message, split at words if it is long; shown at once unless the server echoes. */
@@ -194,6 +242,21 @@ namespace irc {
                         Error quit(Text reason);
                         /** @brief A line as typed (`/raw`, `/quote`): checked only for line breaks. */
                         Error raw(Text line);
+                        /**
+                         * @brief A CTCP request (`PING` without @p args: our clock, for its delay).
+                         *        `Malformed`: not one word, or a line break.
+                         */
+                        Error ctcp(Text target, Text command, Text args, const Now &now);
+                        /**
+                         * @brief The channel list (§7d): with at least @p minUsers and at most
+                         *        @p maxUsers (0: any), filtered at the server as `ELIST` allows (the
+                         *        rest is the caller's to filter).
+                         */
+                        Error list(uint32_t minUsers, uint32_t maxUsers);
+                        /** @brief Watches @p nick: on or off said (MONITOR, else ISON each minute; §7g). */
+                        Error watch(Text nick);
+                        /** @brief Stops watching @p nick. */
+                        void unwatch(Text nick);
                         ///@}
 
                 private:
@@ -229,6 +292,13 @@ namespace irc {
                         void  endCap();
                         void  joinAll();
                         void  identify();
+                        void  startWatching(const Now &now);
+                        void  monitor(char sign, const Vector<String> &nicks);
+                        void  sendIson(const Now &now);
+                        void  setOnline(Text nick, bool on, Text host, const Now &now);
+                        bool  ignored(const Source &src, const Now &now);
+                        void  setChannelMode(Channel &c, char mode, bool on, Text param);
+                        void  scheduleRejoin(const Channel &c, const Now &now);
                         Error say(Text command, Text target, Text text, bool action, const Now &now);
 
                         Config           _config;
@@ -256,6 +326,26 @@ namespace irc {
                         int64_t          _pingSent = -1;
                         int64_t          _lagMs = -1;
                         bool             _timedOut = false;
+                        bool             _performAsked = false; // Perform told; the joins wait for performed()
+                        bool             _performDone = false;
+                        struct Watched {
+                                        String nick;
+                                        int8_t state = -1; // 1 on, 0 off, -1 not known
+                        };
+                        Vector<Watched> _watched;
+                        bool            _watching = false; // MONITOR sent, or ISON going (after the MOTD)
+                        int64_t         _isonAt = -1;
+                        Vector<String>  _isonAsked; // the last ISON's nicks
+                        const Ignores  *_ignores = nullptr;
+                        String          _networkName;
+                        int64_t         _ignoredCount = 0;
+                        int64_t         _ignoredAt = -1; // when to tell the count
+                        struct Rejoin {
+                                        String  name, key;
+                                        int64_t at = -1;   // the join (-1: done)
+                                        int64_t last = -1; // the last one (once a minute)
+                        };
+                        Vector<Rejoin> _rejoins;
         };
 
         /**

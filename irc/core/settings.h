@@ -29,6 +29,7 @@ namespace irc {
                         String   key;
                         String   ca; ///< More roots trusted for this network (a server with its own CA).
                         String   fingerprint; ///< A certificate trusted by its SHA-256 ("SHA256:hex", I5): pinned.
+                        Vector<String> notify;      ///< People watched on it (`notify = a, b`, §7g).
 
                         /** @brief Returns true if it has what connecting needs: a host and a nick. */
                         bool isComplete() const { return !host.isEmpty() && !session.nick.isEmpty(); }
@@ -44,6 +45,20 @@ namespace irc {
                         bool           tree = false; ///< `[view] tree = no`: the conversations in a tree, not tabs (I7)
                         bool           logs = true;      ///< `[logs] enabled = yes`
                         String         logFolder; ///< `[logs] folder = logs` (below the data folder, or absolute)
+                        bool           rejoin = false;      ///< `[behaviour] rejoin = no`: kicked, joined again (§7l)
+                        bool           joinInvited = false; ///< `[behaviour] invite = no`: invited, joined (§7l)
+                        Vector<String> ignores; ///< `[ignore] masks = a!*@*, *!*@h@Network` (§7f, `Ignores::read()`)
+        };
+
+        /** @brief A network of the list shipped with IRC (`servers.ini`, §7c). */
+        struct ServerEntry {
+                        String   name; ///< The section's: Libera.Chat.
+                        String   host;
+                        String   about; ///< A line: who it's for.
+                        uint16_t port = 6697;
+                        bool     tls = true;
+                        Login    login = Login::None; ///< What it offers for a registered nick (sasl...).
+                        bool     offer = false;       ///< One of the first networks offered (I6).
         };
 
         /**
@@ -105,7 +120,24 @@ namespace irc {
         /** @brief Writes @p settings as `settings.ini` into @p out. @return `Ok` or `NoMem`. */
         Error writeSettings(const AppSettings &settings, String &out);
 
-        /** @brief What a new `networks.ini` holds: the first networks offered (I6), not connecting until a nick is set. */
-        extern const char *const FirstNetworks;
+        /** @brief `networks.ini`'s comment, written at its top (the networks follow it). */
+        extern const char *const NetworksComment;
+
+        /**
+         * @brief Reads `servers.ini` (§7c) into @p out: a section a network, `host` (needed),
+         *        `port`, `tls`, `login`, `about`, `offer`; each problem a line of @p problems.
+         * @return `Ok` or `NoMem`.
+         */
+        Error readServers(Text text, Vector<ServerEntry> &out, Vector<String> &problems);
+
+        /**
+         * @brief Writes a first `networks.ini` into @p out: the comment, then the entries of
+         *        @p servers marked `offer` (I6), each without a nick (so not connecting until one is
+         *        set). @return `Ok` or `NoMem`.
+         */
+        Error firstNetworks(const Vector<ServerEntry> &servers, String &out);
+
+        /** @brief Makes @p entry a network's settings in @p out (no nick; autoconnect off). @return `Ok` or `NoMem`. */
+        Error networkFrom(const ServerEntry &entry, NetworkSettings &out);
 
 } // namespace irc

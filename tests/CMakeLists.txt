@@ -22,7 +22,8 @@ add_test(NAME field COMMAND field_test)
 # freestanding C++ ones (the board has no libstdc++).
 set(IRC_CORE ${CMAKE_CURRENT_LIST_DIR}/../irc/core)
 set(IRC_CORE_SRCS ${IRC_CORE}/message.cpp ${IRC_CORE}/str.cpp ${IRC_CORE}/isupport.cpp ${IRC_CORE}/format.cpp ${IRC_CORE}/session.cpp
-                  ${IRC_CORE}/buffers.cpp ${IRC_CORE}/commands.cpp ${IRC_CORE}/complete.cpp ${IRC_CORE}/settings.cpp)
+                  ${IRC_CORE}/buffers.cpp ${IRC_CORE}/commands.cpp ${IRC_CORE}/complete.cpp ${IRC_CORE}/settings.cpp
+                  ${IRC_CORE}/ignore.cpp)
 add_library(irc_core STATIC ${IRC_CORE_SRCS})
 target_include_directories(irc_core PUBLIC ${IRC_CORE})
 target_compile_options(irc_core PRIVATE -fno-exceptions -fno-rtti)

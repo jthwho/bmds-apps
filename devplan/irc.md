@@ -115,6 +115,10 @@ reads messages. As BMDS's Preso (its preso.md §2), the core could later run on 
 | I6 | **The first networks offered:** Libera.Chat and OFTC, each one click and a nick | none: type an address |
 | I7 | **One window; its conversations in tabs** (the default) **or a tree** (View), the user's choice (§6); a second window for a buffer torn off later | the tree only (as first proposed) |
 | I8 | **The program's name `irc`, the application "IRC"**, `apps/irc.app`, a package here (`irc`), released after the next BMDS release | another name |
+| I9 | **A list of networks shipped as a file** (`servers.ini` in `irc.app`, §7c), read only when asked (Networks ▸ Add from list...); the first networks offered (I6) are the ones it marks, so their strings leave the program too | the list in the program (its strings in RAM, a new release to change it); none |
+| I10 | **A channel list as mIRC's** (Channel ▸ List channels..., §7d): `LIST` filtered at the server when it can (`ELIST`), kept in the app and filtered as typed, a column sorted by its header, a double click joining | `/list` printed in the network's tab |
+| I11 | **The members' right-click menu as mIRC's** (§7e): Query, Whois, CTCP, the operator's commands (enabled when we are one), Ignore, Copy nick; BMDS gains `ItemView.menuRequested` (append-only) | a menu of our own app only (the toolkit has none for a list) |
+| I12 | **More of mIRC's base in step 5** (the user's, 2026-11-17; §7f-§7l): what §7b and I3 promised and step 4 didn't build (`/ignore`, Perform, `MONITOR`), and the notify list, Channel Central, mIRC's usual commands, Find, paste protection, rejoining when kicked and joining when invited | later: the Options dialog, a log viewer (wanted, not in step 5); DCC and scripting (a step of their own if ever) |
 
 ## 5. `ChatView` (I1)
 
@@ -160,9 +164,9 @@ tab between the gutter (time and nick) and the text, `linkActivated`, `setMarker
 - **Below the pages,** shared: the input (`LineEdit`: history with Up and Down, Tab completion, a
   nick button to change it) and the status bar (the connection, TLS, the login, lag).
 - **Menus:** Network (Connect, Disconnect, Networks..., Register this nick..., Quit), Channel
-  (Join..., Part, Topic..., Close), View (tabs or tree, members, times, joins and parts shown or
-  not, font), Help. Shortcuts: Alt+1..9, Ctrl+PgUp/PgDn, Ctrl+N next unread, Ctrl+W close,
-  Ctrl+K a colour code.
+  (Join..., List channels..., Part, Topic..., Close), View (tabs or tree, members, times, joins and
+  parts shown or not, font), Help. Shortcuts: Alt+1..9, Ctrl+PgUp/PgDn, Ctrl+N next unread, Ctrl+W
+  close, Ctrl+K a colour code.
 - **Networks...:** a dialog (`Form`): the list, and each one's fields (§4, I3), the login among
   them; a test connection.
 - **Notifications:** a mention or private message in a conversation not in view: a
@@ -228,6 +232,137 @@ A network's login (`networks.ini`, `login=`), as mIRC's server settings offer:
 - **CTCP** in a private message as in §7: `ACTION` shown as an action, `VERSION` and `PING`
   answered, the rest ignored.
 
+### 7c. The list of networks (I9)
+
+- **`servers.ini`** in the app's folder (`$BMDS_APP_DIR`, `bmds_add_app(FILES)`), a section a
+  network in `networks.ini`'s own keys (`host`, `port`, `tls`, `login`) and two of its own:
+  `about` (a line: who it's for) and `offer = yes` (one of the first networks offered, I6). Big
+  public networks, each checked against its own published address and TLS port when written:
+  Libera.Chat, OFTC, EFnet, IRCnet, Undernet, DALnet, QuakeNet, Rizon, hackint, GeekShed, and the
+  like (about 20; TLS where offered, the network's round-robin name rather than one server).
+- **Read when asked:** Networks ▸ **Add from list...**: a dialog with a filter line and a
+  `DetailsView` (Network, About, TLS), Add (or a double click) copies one into the networks as
+  edited, its nick left to fill in. Nothing of it is kept once the dialog closes.
+- **A first start** writes `networks.ini` from the sections with `offer = yes` (Libera.Chat and
+  OFTC); `FirstNetworks` keeps only the file's comment. Run outside a folder (no `BMDS_APP_DIR`,
+  or no file), the button says the list isn't installed and a first start writes the comment only.
+- Updated with the package, as any of its files; a user's `networks.ini` is never touched by it.
+
+### 7d. The channel list (I10)
+
+Channel ▸ **List channels...** (mIRC's "List Channels"), for the network in view:
+
+- **Asking:** a filter: text matched in the name or the topic, at least N users (3 by default:
+  the long tail of one- and two-person channels is most of a big network's list), at most M.
+  Sent as `LIST` with what `ELIST` says the server filters (`U`: `>N`, `<M`; `M`: a mask), the rest
+  filtered here. Get list sends it; a list being received says how many so far, and Stop ignores
+  the rest (IRC has no way to stop one).
+- **Kept** in the app, a network's last list, for its connection: names and topics (colours and
+  codes stripped, a topic cut at 200 bytes) in one PSRAM arena, at most 20,000 channels (said when
+  more were sent). The text filter applies as typed, to what is kept, without asking again.
+- **Shown:** a `DetailsView` (Channel, Users, Topic), the users' column first, sorted by a click on
+  a header (`sortAsked`, `setSortIndicator`), at most 2,000 rows matched ("2,000 of 31,204: narrow
+  the filter"). A double click or Join joins (the page opened); Ctrl+C copies the name.
+- **The session:** `321`, `322` and `323` become events of their own (an entry, the end), not the
+  network tab's server text; an error (`416`, a server's "wait before listing") is the dialog's
+  status line.
+
+### 7e. The members' menu (I11)
+
+A right click on a member (or the Menu key) selects them and pops up, as mIRC's nick list:
+
+| Item | Sends |
+|---|---|
+| Query | opens the private chat (§7b) |
+| Whois | `WHOIS nick nick` (their idle time too), the answer in the page in view |
+| Copy nick | the clipboard |
+| CTCP ▸ Ping, Version, Time | `PRIVMSG nick :\x01PING ...\x01` and so on; the answer shown |
+| Control ▸ Op, Deop, Voice, Devoice (Halfop, Dehalfop where `PREFIX` has `h`) | `MODE #c +o nick`... |
+| Control ▸ Kick, Kick with reason..., Ban, Ban and kick... | `KICK`, `MODE #c +b *!*@host` (their host from `WHO`/the join, else `nick!*@*`) |
+| Ignore / Unignore | `/ignore` (§7b) |
+
+- **Control** is enabled only when we are an operator (halfop: kick and voice) in that channel;
+  the reasons ask in a small dialog. Several selected: the modes as one `MODE` each (`MODES`).
+- **BMDS:** `ItemView.menuRequested(row, x, y)`, appended to `classes.def` (the tree has it, the
+  toolkit's `ItemView::setMenuAsked()` is there already: only the event is new), so any program's
+  list gets a menu. The channel list's rows go in with `addRow` a call each (2,000 in 0.3 s on the
+  board, once BMDS's quadratic adding was fixed: §10, 5a).
+
+### 7f. Promised and not built: `/ignore`, Perform, `MONITOR` (I12)
+
+- **`/ignore nick|mask [network]`**, `/unignore`, `/ignore` alone listing them: a nick is
+  `nick!*@*`; kept in `settings.ini` (`[ignore] masks = a!*@*, *!*@host`, `@network` after one
+  for a network only). From someone ignored: messages, notices, CTCP, invites and their opening a
+  private chat are dropped (counted in the network's tab once a minute at most, not shown).
+  Joins, parts and nick changes still show, so a channel's members stay right.
+- **Perform** (mIRC's, I3's "commands to send on connecting"): `perform = ...` lines in a
+  network's section, in order, each a typed line (`/mode $me +x`, `/msg Q@CServe... `), `$me`
+  our nick. Sent once registered and logged in (after NickServ's answer when `login=nickserv`),
+  before the channels are joined. Networks... edits them in a `TextEdit`, a line each.
+- **`MONITOR`** (when `ISUPPORT` has it, else `ISON` every 60 s while the list isn't empty) for
+  the open private chats and the notify list (§7g): `730`/`731` show "alice is online/offline"
+  in their private chat.
+
+### 7g. The notify list (mIRC's address book)
+
+- **A network's friends:** `notify = alice, bob` in its section (`networks.ini`), watched with
+  `MONITOR` (or `ISON`, §7f) from the start of each connection.
+- **Coming online:** a notification ("alice is on Libera.Chat", Open: a private chat) and a line
+  in the network's tab; going offline, the line only.
+- **Network ▸ Notify list...:** a `DetailsView` (Nick, Network, Online since / Last seen), Add,
+  Remove, a double click opening a private chat; the member menu's **Add to notify list**.
+
+### 7h. Channel Central
+
+Channel ▸ **Channel Central...** (and a double click on a channel's topic), for the channel in
+view, as mIRC's:
+
+- **The topic** (a `LineEdit`, with who set it and when) and **the modes**: `n` `t` `i` `m` `s` `p`
+  as check boxes, `k` key and `l` limit as fields; others the network has (`CHANMODES`) as text.
+- **The lists:** Bans, Exceptions, Invites (`367`/`368`, `348`/`349`, `346`/`347`, only those
+  `CHANMODES` has), each a `DetailsView` (Mask, Set by, When), Add and Remove.
+- **OK** sends what changed (the topic, modes paced in `MODES`-sized `MODE` lines); not an
+  operator, the fields read only (what `+t` allows: the topic stays editable).
+
+### 7i. mIRC's usual commands
+
+Added to the 23 there are, each a line of `runCommand` with a PC test:
+
+| Command | Does |
+|---|---|
+| `/op /deop /voice /devoice /hop /dehop nick...` | `MODE #c +ooo a b c`, in `MODES`-sized lines |
+| `/ban nick|mask`, `/unban`, `/kb nick [reason]` | the ban mask as §7e; `/kb` bans then kicks |
+| `/ctcp nick what`, `/ping nick` | a CTCP request, the answer shown with its delay |
+| `/ignore`, `/unignore` | §7f |
+| `/list [filter]` | opens the channel list (§7d) with the filter |
+| `/whowas nick`, `/who mask`, `/mode` alone, `/away` without text | the replies in the page in view |
+| `/server host [port] [+tls]`, `/server -m` | connects the network in view there (or a new one, `-m`: not saved) |
+| `/notify nick`, `/unnotify` | the notify list (§7g) |
+| `/find text` | the find bar (§7j) |
+
+### 7j. Find in a conversation
+
+**Ctrl+F** (Edit ▸ Find, `/find`): a bar above the input (a `LineEdit`, Previous, Next, Close);
+Enter and Shift+Enter step, Esc closes. BMDS gains **`ChatView.find(text, backward) → Bool`**:
+the next match from the selection (or the end), case ignored, colours and codes ignored; it
+selects the match and scrolls it into view, so Ctrl+C copies it.
+
+### 7k. Paste protection
+
+A paste of more than one line, as mIRC's: a question ("Send 14 lines to #bmds?", Send, Edit,
+Cancel), then the lines sent paced (§7: a second each after five), an empty line skipped; Edit puts
+them in a multi-line editor (`TextEdit`) to change first. A command line pasted (`/...`) is sent as
+text, never run. BMDS: a `LineEdit` takes one line of 255 bytes and makes a paste's line breaks
+spaces, so it gains **`LineEdit.pasteLines`** (`Bool`, off by default): set, a paste holding a line
+break or longer than fits isn't inserted but given to the program as **`pasteRequested(String)`**.
+
+### 7l. Rejoining and invitations
+
+Channel ▸ **Rejoin when kicked** and **Join when invited** (checked items, `settings.ini`
+`[behaviour] rejoin = no`, `invite = no`, both off as mIRC's): kicked, the channel rejoined after
+3 s (its key kept), once a minute at most; invited (`INVITE`), joined when not ignored, and always
+said.
+
 ## 8. Budget (estimates)
 
 - **Program:** 250-350 KB (musl, libbmdsgui, libtls or `tls_ctl`, the core).
@@ -256,7 +391,19 @@ A network's login (`networks.ini`, `login=`), as mIRC's server settings offer:
    built with `-DBMDS_SDK_DIR`, against `tools/irc-test-server`, then Libera.
 4. **Several networks, Networks..., Register this nick... and taking our nick back, the tree
    view, notifications and the tray, pinning a fingerprint, reconnecting.**
-5. **Release:** after BMDS's next release, the SDK pin raised, `irc` in the repository's
+5. **More of mIRC** (§7c-§7l), in three parts:
+   - **5a, BMDS:** `ItemView.menuRequested`, `ChatView.find`, `LineEdit.pasteLines` and
+     `pasteRequested` (and `DetailsView.addRows` if 2,000 `addRow`s measure slow), appended to
+     `classes.def` with guitest and the gallery; before the next BMDS release. **Built**
+     (2026-11-17, BMDS's gui.md §4v). 2,000 `addRow`s took 11.7 s: the item model copied every
+     row on each add. Fixed there (0.3 s, 5,000 in 0.9 s), so no `addRows`.
+   - **5b, the core:** `LIST`, `MONITOR`/`ISON`, the ban, exception and invite lists' numerics,
+     ignore masks, Perform, rejoin and invitations, the commands (§7i), `servers.ini`'s reader;
+     PC tests and the fuzzers; the test server gains `LIST` with `ELIST`, many fake channels,
+     `MONITOR`, the lists and `INVITE`. **Built** (2026-11-17, §18).
+   - **5c, the app:** Add from list..., List channels..., the member menu, Channel Central, the
+     notify list, Find, paste protection, the Channel menu's options; tried on the board.
+6. **Release:** after BMDS's next release, the SDK pin raised, `irc` in the repository's
    packages, the README's list; a tag (`vN`) as every release here.
 
 ## 11. Decided
@@ -540,3 +687,42 @@ too), inside §8's estimate.
   its frame by default (for bars at the edges), so the dialogs set
   `margin` 8 and `spacing` 4, as the gallery's dialog does. A gap under each form was the
   toolkit's: fixed in BMDS (its gui.md §4u: a form in a column is sized at the column's width).
+
+## 18. Step 5b, the core, built (2026-11-17)
+
+- **The session:** `LIST` (`list(min, max)`: `>n,<n` when `ELIST` has `U`), its `ListStart`,
+  `ListEntry` (users, topic) and `ListEnd` (a `263`/`416` refusal its text); `324` channel
+  modes kept in `Channel::modes` (and changed by `MODE`; lists and members' modes not), `333`
+  who set the topic and when; the ban, exception and invite lists as `ModeListEntry`/`End`;
+  members' `user@host` (their join, `userhost-in-names` now asked for, `CHGHOST`) for bans.
+- **Watching (§7g):** `watch()`/`unwatch()`; once the MOTD ends (`376`/`422`, ISUPPORT known),
+  `MONITOR +` in lines of 400 bytes within its limit, else `ISON` each minute (one line; the
+  answer names only who is on). `Online` when not seen on before, `Offline` only after on.
+- **Perform:** `Perform` told when the joins would go (after NickServ's answer with
+  `login=nickserv`); the joins wait for `performed()`. The app runs each line
+  (`performLine()`: `$me`, a `/` added) in the network's tab. Without perform lines, as before.
+- **Ignoring (§7f):** `Ignores` (`ignore.h`): masks normalized (`nick`, `nick!user`,
+  `user@host`), a network each or all, a wildcard match without recursion; the session drops
+  messages, notices, CTCP (unanswered) and invites from them, never a service's, and tells the
+  count a minute after the first. `[ignore] masks` in `settings.ini`.
+- **Kicks and invitations (§7l):** `Config::rejoin`: back after 3 s with the channel's `+k` (or
+  the autojoin's key), not twice in a minute. `joinInvited`: joined, the `Invite` marked.
+- **CTCP:** `ctcp()` (a `PING` carries our clock); answers shown (`CtcpReply`, a PING's ms),
+  where before they were dropped.
+- **Commands (§7i):** the operator's in `MODES`-sized lines (half-ops refused without `h`),
+  `/ban /unban /kb` (`banMask()`: `*!*@host` when known), `/ctcp /ping /who /whowas`, `/mode`
+  alone, `/away` alone back; `/list /find /ignore /unignore /notify /unnotify /server` are the
+  app's (`Outcome`'s new actions: 5c). 43 commands.
+- **Settings:** `perform =` (a line each, kept in order) and `notify =` per network;
+  `[behaviour] rejoin`, `invite`; `[ignore] masks`. `servers.ini` (§7c), shipped in `irc.app`:
+  17 networks, each checked on its own site that day by a helper agent (no connection made).
+  Left out: EpiKnet (its connect page carries injected spam), GIMPNet (no current page gives a
+  port), 2600net, SlashNET and IRCHighWay (no official page); Ergo's network, not its testnet
+  (which logs all traffic). A first start writes `networks.ini` from its `offer = yes` ones
+  (Libera.Chat, OFTC): tried on the board, from the folder, with an empty home.
+- **Tests:** 70 cases (14 new). The session fuzzer also drives ignores (fuzzed masks), watching,
+  Perform, rejoin and invitations, and found a CTCP answer's text not made UTF-8 (fixed: as any
+  text); 2.6 million runs clean after. The test server gains `LIST` (2,000 made-up channels,
+  `ELIST=U`), `MONITOR` (`--no-monitor` for ISON), `ISON`, channel modes and the three lists,
+  `333`, `KICK`, `INVITE`, `userhost-in-names`, alice's CTCP answers, and TestServ's `KICKME`,
+  `INVITE`, `BOB` (bob quits or comes back) and `LISTWAIT` (the next `LIST` refused).

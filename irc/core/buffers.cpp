@@ -10,6 +10,8 @@
 
 #include "format.h"
 
+#include <cstdio>
+
 namespace irc {
 
         namespace {
@@ -372,10 +374,84 @@ namespace irc {
                                 colouredNick(text, e.nick, false, mapping);
                                 (void)text.append(" invited you to ");
                                 (void)text.append(e.text);
+                                if (!e.extra.isEmpty()) (void)text.append(" (joining)");
                                 return add(network(), e, 1, "--", text, out);
 
+                        case Kind::Online:
+                        case Kind::Offline: {
+                                // The network's buffer, and their private chat if one is open.
+                                colouredNick(text, e.nick, false, mapping);
+                                (void)text.append(e.kind == Kind::Online ? " is online" : " is offline");
+                                if (!e.extra.isEmpty()) {
+                                        (void)text.append(" (");
+                                        (void)text.append(e.extra);
+                                        (void)text.append(')');
+                                }
+                                Buffer *chat = find(e.nick, mapping);
+                                if (chat != nullptr && chat->type == Buffer::Type::Query) {
+                                        const Error err = add(*chat, e, 0, "--", text, out);
+                                        if (err != Error::Ok) return err;
+                                }
+                                return add(network(), e, 0, "--", text, out);
+                        }
+
+                        case Kind::CtcpReply: {
+                                // Where it was asked from (the buffer in view): "alice's VERSION: ...".
+                                b = byId(_active);
+                                if (b == nullptr) b = &network();
+                                colouredNick(text, e.nick, false, mapping);
+                                (void)text.append("'s ");
+                                const Text   t = e.text;
+                                const size_t space = t.find(' ');
+                                (void)text.append(space == Text::NoPos ? t : t.left(space));
+                                if (e.number > 0 || t.left(space).equalsIgnoringCase("PING")) {
+                                        char ms[32];
+                                        snprintf(ms, sizeof(ms), ": %lld ms", (long long)e.number);
+                                        (void)text.append(ms);
+                                } else if (space != Text::NoPos) {
+                                        (void)text.append(": ");
+                                        (void)text.append(t.mid(space + 1));
+                                }
+                                return add(*b, e, 0, "--", text, out);
+                        }
+
+                        case Kind::Ignored: {
+                                char said[64];
+                                snprintf(said, sizeof(said), "%lld message%s from people ignored, not shown",
+                                         (long long)e.number, e.number == 1 ? "" : "s");
+                                return add(network(), e, 0, "--", said, out);
+                        }
+
+                        case Kind::ListEnd:
+                                // The list itself is the dialog's; a refusal said here too.
+                                if (e.text.isEmpty()) return Error::Ok;
+                                (void)text.assign("The channel list: ");
+                                (void)text.append(e.text);
+                                return add(network(), e, 0, "--", text, out);
+
+                        case Kind::ModeListEntry: {
+                                // A list asked for by hand (/mode #c b); Channel Central takes them itself.
+                                b = find(e.target, mapping);
+                                if (b == nullptr) b = &network();
+                                const char mode = e.extra.isEmpty() ? 'b' : e.extra.view()[0];
+                                (void)text.append(e.target);
+                                (void)text.append(mode == 'e' ? " exception: " : mode == 'I' ? " invite: " : " ban: ");
+                                (void)text.append(e.text);
+                                if (!e.nick.isEmpty()) {
+                                        (void)text.append(" (by ");
+                                        (void)text.append(e.nick);
+                                        (void)text.append(')');
+                                }
+                                return add(*b, e, 0, "--", text, out);
+                        }
+
                         case Kind::Members:
-                        case Kind::Lag: return Error::Ok;
+                        case Kind::Lag:
+                        case Kind::Perform:
+                        case Kind::ListStart:
+                        case Kind::ListEntry:
+                        case Kind::ModeListEnd:
+                        case Kind::ChannelModes: return Error::Ok;
                 }
                 return Error::Ok;
         }

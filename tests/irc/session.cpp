@@ -468,3 +468,252 @@ TEST_CASE("ERROR ends it; reconnecting waits 2, 4 ... 300 s, a fifth either way"
                 }
         CHECK(irc::reconnectDelayMs(0, 20) == 2000);
 }
+
+TEST_CASE("Perform: told once registered (and logged in), the joins waiting for performed()") {
+        irc::Config c = withAutojoin(test::config("jth"), {"#bmds"});
+        irc::String line;
+        (void)line.assign("/mode $me +x");
+        (void)c.perform.append(std::move(line));
+        Server s(std::move(c));
+        s.connect();
+        s.take();
+        s.say(":srv 001 jth :Welcome");
+        CHECK(s.take().empty()); // no joins yet
+        auto events = s.takeEvents();
+        REQUIRE(find(events, Kind::Perform) != nullptr);
+        s.wait(30000);
+        CHECK(s.take().empty());                               // still waiting: no timer for it
+        CHECK(find(s.takeEvents(), Kind::Perform) == nullptr); // told once
+        REQUIRE(s.session.raw("MODE jth +x") == Error::Ok);    // what the app runs
+        s.session.performed();
+        s.flush();
+        CHECK(s.take() == Lines{"MODE jth +x", "JOIN #bmds"});
+        // A new connection asks again.
+        s.session.disconnected();
+        s.connect();
+        s.say(":srv 001 jth :Welcome");
+        CHECK(find(s.takeEvents(), Kind::Perform) != nullptr);
+}
+
+TEST_CASE("LIST: filtered as ELIST allows; its start, entries, end; a refusal") {
+        Server s(test::config("jth"));
+        s.registerAs("jth");
+        REQUIRE(s.session.list(3, 0) == Error::Ok);
+        s.flush();
+        CHECK(s.take() == Lines{"LIST"}); // no ELIST: everything, filtered by the caller
+        s.say(":srv 005 jth ELIST=CMNTU :are supported");
+        REQUIRE(s.session.list(3, 100) == Error::Ok);
+        s.flush();
+        CHECK(s.take() == Lines{"LIST >2,<101"});
+        REQUIRE(s.session.list(0, 0) == Error::Ok);
+        s.flush();
+        CHECK(s.take() == Lines{"LIST"});
+        s.say(":srv 321 jth Channel :Users  Name");
+        s.say(":srv 322 jth #bmds 12 :[+nt] \x02"
+              "BMDS\x02 talk");
+        s.say(":srv 322 jth #quiet 3 :");
+        s.say(":srv 323 jth :End of /LIST");
+        auto events = s.takeEvents();
+        REQUIRE(events.size() == 4);
+        CHECK(events[0].kind == Kind::ListStart);
+        CHECK(events[1].kind == Kind::ListEntry);
+        CHECK(events[1].target == "#bmds");
+        CHECK(events[1].number == 12);
+        CHECK(events[1].text == "[+nt] \x02"
+                                "BMDS\x02 talk");
+        CHECK(events[2].number == 3);
+        CHECK(events[3].kind == Kind::ListEnd);
+        CHECK(events[3].text.empty());
+        s.say(":srv 263 jth LIST :Please wait a while and try again.");
+        events = s.takeEvents();
+        REQUIRE(events.size() == 1);
+        CHECK(events[0].kind == Kind::ListEnd);
+        CHECK(events[0].text == "Please wait a while and try again.");
+        s.say(":srv 263 jth WHO :Please wait"); // another command's: the server's text
+        CHECK(s.takeEvents()[0].kind == Kind::ServerText);
+}
+
+TEST_CASE("Watching with MONITOR: sent after the MOTD, on and off told; added and removed later") {
+        Server s(test::config("jth"));
+        REQUIRE(s.session.watch("alice") == Error::Ok);
+        REQUIRE(s.session.watch("bob") == Error::Ok);
+        REQUIRE(s.session.watch("ALICE") == Error::Ok); // the same one
+        CHECK(s.session.watch("a b") == Error::Malformed);
+        s.registerAs("jth");
+        s.say(":srv 005 jth MONITOR=100 :are supported");
+        s.say(":srv 376 jth :End of /MOTD command.");
+        CHECK(s.take() == Lines{"MONITOR + alice,bob"});
+        s.takeEvents();
+        s.say(":srv 730 jth :alice!a@alice.example");
+        s.say(":srv 731 jth :bob");
+        auto events = s.takeEvents();
+        REQUIRE(events.size() == 1); // bob: off, not seen on, not told
+        CHECK(events[0].kind == Kind::Online);
+        CHECK(events[0].nick == "alice");
+        CHECK(events[0].extra == "a@alice.example");
+        CHECK(s.session.online("alice") == 1);
+        CHECK(s.session.online("bob") == 0);
+        CHECK(s.session.online("carol") == -1);
+        s.say(":srv 731 jth :alice");
+        events = s.takeEvents();
+        REQUIRE(events.size() == 1);
+        CHECK(events[0].kind == Kind::Offline);
+        REQUIRE(s.session.watch("carol") == Error::Ok);
+        s.flush();
+        CHECK(s.take() == Lines{"MONITOR + carol"});
+        s.session.unwatch("bob");
+        s.flush();
+        CHECK(s.take() == Lines{"MONITOR - bob"});
+        // A new connection: not known again, sent again.
+        s.session.disconnected();
+        CHECK(s.session.online("alice") == -1);
+        s.registerAs("jth");
+        s.say(":srv 005 jth MONITOR :are supported"); // no limit
+        s.say(":srv 422 jth :MOTD File is missing");
+        CHECK(s.take() == Lines{"MONITOR + alice,carol"});
+}
+
+TEST_CASE("Watching without MONITOR: ISON each minute, on and off by its answer") {
+        Server s(test::config("jth"));
+        REQUIRE(s.session.watch("alice") == Error::Ok);
+        REQUIRE(s.session.watch("bob") == Error::Ok);
+        s.registerAs("jth");
+        s.say(":srv 376 jth :End of /MOTD command.");
+        CHECK(s.take() == Lines{"ISON :alice bob"});
+        s.takeEvents(); // the MOTD's end, shown
+        s.say(":srv 303 jth :Alice");
+        auto events = s.takeEvents();
+        REQUIRE(events.size() == 1);
+        CHECK(events[0].kind == Kind::Online);
+        s.wait(irc::Session::IsonEveryMs);
+        CHECK(s.take() == Lines{"ISON :alice bob"});
+        s.say(":srv 303 jth :bob");
+        events = s.takeEvents();
+        REQUIRE(events.size() == 2);
+        CHECK(events[0].kind == Kind::Offline);
+        CHECK(events[0].nick == "alice");
+        CHECK(events[1].kind == Kind::Online);
+        CHECK(events[1].nick == "bob");
+        s.say(":srv 303 jth :carol"); // not asked by us: a typed /ison's, shown
+        CHECK(s.takeEvents()[0].kind == Kind::ServerText);
+        s.session.unwatch("alice");
+        s.session.unwatch("bob");
+        s.wait(irc::Session::IsonEveryMs * 2);
+        for (const std::string &line : s.take()) CHECK(line.rfind("ISON", 0) != 0); // no one watched: no ISON
+}
+
+TEST_CASE("Ignored: messages, CTCP and invites dropped, counted a minute later; services not") {
+        Server       s(test::config("jth"));
+        irc::Ignores ignores;
+        REQUIRE(ignores.read("spam!*@*, *!*@bad.example@Elsewhere") == Error::Ok);
+        s.session.setIgnores(&ignores, "TestNet");
+        s.registerAs("jth");
+        s.say(":spam!s@x PRIVMSG jth :buy now");
+        s.say(":spam!s@x PRIVMSG #bmds :buy now");
+        s.say(":spam!s@x PRIVMSG jth :\x01VERSION\x01");
+        s.say(":spam!s@x INVITE jth #spam");
+        s.say(":other!o@bad.example PRIVMSG jth :hello"); // ignored on another network only
+        CHECK(s.take().empty());                          // no CTCP answer
+        auto events = s.takeEvents();
+        REQUIRE(events.size() == 1);
+        CHECK(events[0].nick == "other");
+        s.wait(irc::Session::IgnoredEveryMs);
+        events = s.takeEvents();
+        REQUIRE(find(events, Kind::Ignored) != nullptr);
+        CHECK(find(events, Kind::Ignored)->number == 4);
+        s.wait(irc::Session::IgnoredEveryMs * 2);
+        CHECK(find(s.takeEvents(), Kind::Ignored) == nullptr); // nothing more: nothing told
+        REQUIRE(ignores.read("*!*@*") == Error::Ok);
+        s.say(":NickServ!NickServ@services. NOTICE jth :This nickname is registered");
+        CHECK(find(s.takeEvents(), Kind::Notice) != nullptr); // a service is never ignored
+}
+
+TEST_CASE("Kicked with rejoin: back after 3 s with the key, once a minute; invited with joinInvited: joined") {
+        irc::Config c = test::config("jth");
+        c.rejoin = true;
+        c.joinInvited = true;
+        Server s(std::move(c));
+        s.registerAs("jth");
+        s.say(":jth!u@h JOIN #bmds");
+        s.say(":op!o@h MODE #bmds +k sesame");
+        s.say(":op!o@h KICK #bmds jth :out");
+        s.take();
+        s.wait(irc::Session::RejoinAfterMs - 10);
+        CHECK(s.take().empty());
+        s.wait(20);
+        CHECK(s.take() == Lines{"JOIN #bmds sesame"});
+        s.say(":jth!u@h JOIN #bmds");
+        s.say(":op!o@h KICK #bmds jth :again");
+        s.wait(irc::Session::RejoinAfterMs * 2);
+        CHECK(s.take().empty()); // twice in a minute: stays out
+        s.wait(irc::Session::RejoinOnceMs);
+        s.say(":jth!u@h JOIN #bmds");
+        s.say(":op!o@h KICK #bmds jth :later");
+        s.wait(irc::Session::RejoinAfterMs);
+        CHECK(s.take() == Lines{"JOIN #bmds"}); // a minute on: back (its key no longer set)
+
+        s.say(":alice!a@h INVITE jth #fun");
+        CHECK(s.take() == Lines{"JOIN #fun"});
+        auto events = s.takeEvents();
+        REQUIRE(find(events, Kind::Invite) != nullptr);
+        CHECK(find(events, Kind::Invite)->extra == "joining");
+}
+
+TEST_CASE("Channel modes, the topic's setter, ban lists, member hosts, CTCP answers") {
+        Server s(test::config("jth"));
+        s.registerAs("jth");
+        s.say(":srv 005 jth CHANMODES=beI,k,l,imnpst :are supported");
+        s.say(":jth!u@h JOIN #bmds");
+        s.say(":srv 353 jth = #bmds :@alice!a@alice.example bob!b@bob.example jth!u@h");
+        s.say(":srv 366 jth #bmds :End");
+        s.say(":srv 324 jth #bmds +ntl 20");
+        s.say(":srv 333 jth #bmds alice!a@alice.example 1763289600");
+        const irc::Channel *ch = s.session.channel("#bmds");
+        REQUIRE(ch != nullptr);
+        REQUIRE(ch->modes.size() == 3);
+        CHECK(ch->modes[2].mode == 'l');
+        CHECK(ch->modes[2].param == Text("20"));
+        CHECK(ch->topicBy == Text("alice"));
+        CHECK(ch->topicAt == 1763289600000);
+        CHECK(s.session.hostOf("BOB") == Text("b@bob.example"));
+        s.say(":alice!a@alice.example MODE #bmds -l+k-t+b secret *!*@x");
+        REQUIRE(ch->modes.size() == 2);
+        CHECK(ch->modes[0].mode == 'n');
+        CHECK(ch->modes[1].mode == 'k');
+        CHECK(ch->modes[1].param == Text("secret"));
+        s.say(":alice!a@alice.example TOPIC #bmds :new");
+        CHECK(ch->topicBy == Text("alice"));
+        auto events = s.takeEvents();
+        REQUIRE(find(events, Kind::ChannelModes) != nullptr);
+
+        s.say(":srv 367 jth #bmds *!*@spam alice!a@alice.example 1763289600");
+        s.say(":srv 368 jth #bmds :End of Channel Ban List");
+        s.say(":srv 348 jth #bmds *!*@friend");
+        s.say(":srv 349 jth #bmds :End");
+        events = s.takeEvents();
+        REQUIRE(events.size() == 4);
+        CHECK(events[0].kind == Kind::ModeListEntry);
+        CHECK(events[0].extra == "b");
+        CHECK(events[0].text == "*!*@spam");
+        CHECK(events[0].nick == "alice");
+        CHECK(events[0].number == 1763289600);
+        CHECK(events[1].kind == Kind::ModeListEnd);
+        CHECK(events[2].extra == "e");
+        CHECK(events[2].nick.empty());
+
+        // CTCP: our PING carries our clock; its answer the delay.
+        REQUIRE(s.session.ctcp("alice", "ping", "", s.now) == Error::Ok);
+        s.flush();
+        const Lines sent = s.take();
+        REQUIRE(sent.size() == 1);
+        const std::string stamp = sent[0].substr(sent[0].find("PING ") + 5, sent[0].size() - sent[0].find("PING ") - 6);
+        s.wait(250);
+        s.say(":alice!a@alice.example NOTICE jth :\x01PING " + stamp + "\x01");
+        s.say(":alice!a@alice.example NOTICE jth :\x01VERSION mIRC v7\x01");
+        events = s.takeEvents();
+        REQUIRE(events.size() == 2);
+        CHECK(events[0].kind == Kind::CtcpReply);
+        CHECK(events[0].number == 250);
+        CHECK(events[1].text == "VERSION mIRC v7");
+        CHECK(s.session.ctcp("alice", "two words", "", s.now) == Error::Malformed);
+}

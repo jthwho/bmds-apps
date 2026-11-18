@@ -11,6 +11,8 @@
 #include "helpers.h"
 #include "settings.h"
 
+#include <cstdio>
+
 using irc::Error;
 using irc::Login;
 using irc::Text;
@@ -129,25 +131,91 @@ TEST_CASE("networks.ini: mistakes told by line; a network without a host or nick
         CHECK(nets[3].isComplete());       // D: complete, though its login can't work
 }
 
-TEST_CASE("networks.ini: the first one written has Libera.Chat and OFTC, waiting for a nick") {
+TEST_CASE("servers.ini: read; the first networks.ini made of the ones offered, waiting for a nick") {
+        const char                   *ini = "# the list\n"
+                                            "[Libera.Chat]\nhost = irc.libera.chat\nport = 6697\ntls = yes\nlogin = sasl\n"
+                                            "about = Free and open source projects\noffer = yes\n"
+                                            "[Plain]\nhost = irc.plain.example\nport = 6667\ntls = no\n"
+                                            "[NoHost]\nport = 6697\n"
+                                            "[Odd]\nhost = odd.example\nport = 99999\nlogin = magic\ncolour = blue\n"
+                                            "[OFTC]\nhost = irc.oftc.net\noffer = yes\n";
+        irc::Vector<irc::ServerEntry> servers;
+        irc::Vector<irc::String>      problems;
+        REQUIRE(irc::readServers(ini, servers, problems) == Error::Ok);
+        REQUIRE(servers.size() == 4); // NoHost dropped
+        CHECK(servers[0].login == Login::Sasl);
+        CHECK(servers[0].offer);
+        CHECK(servers[0].about == Text("Free and open source projects"));
+        CHECK(servers[1].port == 6667);
+        CHECK_FALSE(servers[1].tls);
+        CHECK(servers[2].port == 6697); // the bad port ignored
+        CHECK(servers[3].port == 6697); // the default
+        const std::vector<std::string> p = strings(problems);
+        REQUIRE(p.size() == 4);
+        CHECK(p[0].find("a port is 1 to 65535") != std::string::npos);
+        CHECK(p[1].find("login is none, sasl or nickserv") != std::string::npos);
+        CHECK(p[2].find("not a list entry's setting: colour") != std::string::npos);
+        CHECK(p[3] == "servers.ini: NoHost: no host");
+
+        irc::String text;
+        REQUIRE(irc::firstNetworks(servers, text) == Error::Ok);
+        CHECK(test::str(text).rfind("# IRC's networks", 0) == 0);
         irc::Vector<irc::NetworkSettings> nets;
-        irc::Vector<irc::String>          problems;
-        REQUIRE(irc::readNetworks(irc::FirstNetworks, nets, problems) == Error::Ok);
+        problems.clear();
+        REQUIRE(irc::readNetworks(text, nets, problems) == Error::Ok);
         REQUIRE(nets.size() == 2);
         CHECK(nets[0].name == Text("Libera.Chat"));
         CHECK(nets[1].host == Text("irc.oftc.net"));
         CHECK_FALSE(nets[0].isComplete());
-        const std::vector<std::string> p = strings(problems);
-        REQUIRE(p.size() == 2);
-        CHECK(p[0].find("OFTC: no nick") != std::string::npos);
-        CHECK(p[1].find("Libera.Chat: no nick") != std::string::npos);
+        CHECK_FALSE(nets[0].autoconnect);
+        CHECK(nets[0].session.login == Login::None); // no password yet
+        REQUIRE(strings(problems).size() == 2);
+        CHECK(strings(problems)[0].find("no nick") != std::string::npos);
+
+        irc::Vector<irc::ServerEntry> none;
+        REQUIRE(irc::firstNetworks(none, text) == Error::Ok);
+        nets.clear();
+        REQUIRE(irc::readNetworks(text, nets, problems) == Error::Ok);
+        CHECK(nets.size() == 0); // the comment alone
+}
+
+TEST_CASE("servers.ini as shipped: every entry whole, TLS, Libera.Chat and OFTC offered") {
+        // irc/servers.ini, beside this file's folder's parent.
+        std::string path = __FILE__;
+        path = path.substr(0, path.rfind('/')); // tests/irc
+        path = path.substr(0, path.rfind('/')); // tests
+        path = path.substr(0, path.rfind('/')) + "/irc/servers.ini";
+        FILE *f = fopen(path.c_str(), "rb");
+        if (f == nullptr) {
+                FAIL_CHECK("no ", path); // without exceptions a REQUIRE doesn't stop the test
+                return;
+        }
+        std::string text;
+        char        chunk[4096];
+        size_t      n;
+        while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) text.append(chunk, n);
+        fclose(f);
+        irc::Vector<irc::ServerEntry> servers;
+        irc::Vector<irc::String>      problems;
+        REQUIRE(irc::readServers(test::text(text), servers, problems) == Error::Ok);
+        CHECK(strings(problems).empty());
+        CHECK(servers.size() >= 15);
+        std::vector<std::string> offered;
+        for (const irc::ServerEntry &e : servers) {
+                CAPTURE(test::str(e.name));
+                CHECK(!e.about.isEmpty());
+                CHECK(e.host.view().find('.') != Text::NoPos);
+                if (e.offer) offered.push_back(test::str(e.name));
+        }
+        CHECK(offered == std::vector<std::string>{"Libera.Chat", "OFTC"});
 }
 
 TEST_CASE("networks.ini: written and read back the same; copied") {
         const char                       *ini = "[Libera.Chat]\n"
                                                 "host = irc.libera.chat\nport = 6697\ntls = yes\nnick = jth\naltnicks = jth_, jth2\n"
                                                 "user = u\nrealname = Jason H\nlogin = sasl\naccount = jthacct\npassword = p a s s\n"
-                                                "channels = #bmds, #c key\nautoconnect = no\n"
+                                                "channels = #bmds, #c key\nperform = /mode $me +x\n"
+                                                "perform = /msg bot hello\nnotify = alice, bob\nautoconnect = no\n"
                                                 "[Test]\nhost = 1.2.3.4\nport = 7000\ntls = no\nnick = t\nlogin = sasl-external\n"
                                                 "cert = me.pem\nkey = me.key\nca = ca.pem\nfingerprint = SHA256:abcd\n";
         irc::Vector<irc::NetworkSettings> nets, back;
@@ -174,12 +242,19 @@ TEST_CASE("networks.ini: written and read back the same; copied") {
                 CHECK(a.session.account == b.session.account.view());
                 CHECK(a.session.password == b.session.password.view());
                 CHECK(strings(a.session.autojoin) == strings(b.session.autojoin));
+                CHECK(strings(a.session.perform) == strings(b.session.perform));
+                CHECK(strings(a.notify) == strings(b.notify));
                 CHECK(a.cert == b.cert.view());
                 CHECK(a.key == b.key.view());
                 CHECK(a.ca == b.ca.view());
                 CHECK(a.fingerprint == b.fingerprint.view());
         }
+        CHECK(strings(nets[0].session.perform) == std::vector<std::string>{"/mode $me +x", "/msg bot hello"});
+        CHECK(strings(nets[0].notify) == std::vector<std::string>{"alice", "bob"});
         irc::NetworkSettings copy;
+        REQUIRE(irc::copySettings(nets[0], copy) == Error::Ok);
+        CHECK(strings(copy.session.perform).size() == 2);
+        CHECK(strings(copy.notify).size() == 2);
         REQUIRE(irc::copySettings(nets[1], copy) == Error::Ok);
         CHECK(copy.fingerprint == Text("SHA256:abcd"));
         CHECK(copy.session.login == Login::SaslExternal);
@@ -195,7 +270,12 @@ TEST_CASE("settings.ini: joins, highlights, logs; mistakes told") {
                                        "enabled = no\n"
                                        "folder = /sd0/p0/irclogs\n"
                                        "[view]\n"
-                                       "font = huge\n";
+                                       "font = huge\n"
+                                       "[behaviour]\n"
+                                       "rejoin = yes\n"
+                                       "invite = maybe\n"
+                                       "[ignore]\n"
+                                       "masks = spam!*@*, *!*@x@Libera.Chat\n";
         irc::AppSettings         s;
         irc::Vector<irc::String> problems;
         REQUIRE(irc::readSettings(ini, s, problems) == Error::Ok);
@@ -203,7 +283,11 @@ TEST_CASE("settings.ini: joins, highlights, logs; mistakes told") {
         CHECK(strings(s.highlights) == std::vector<std::string>{"bmds", "esp32", "p4"});
         CHECK_FALSE(s.logs);
         CHECK(s.logFolder == Text("/sd0/p0/irclogs"));
-        CHECK(strings(problems) == std::vector<std::string>{"settings.ini:9: not a setting: view/font"});
+        CHECK(strings(problems) == std::vector<std::string>{"settings.ini:9: not a setting: view/font",
+                                                            "settings.ini:12: invite is yes or no: maybe"});
+        CHECK(s.rejoin);
+        CHECK_FALSE(s.joinInvited);
+        CHECK(strings(s.ignores) == std::vector<std::string>{"spam!*@*", "*!*@x@Libera.Chat"});
 
         // Written and read back: the same.
         s.tree = true;
@@ -218,6 +302,8 @@ TEST_CASE("settings.ini: joins, highlights, logs; mistakes told") {
         CHECK(strings(back.highlights) == std::vector<std::string>{"bmds", "esp32", "p4"});
         CHECK_FALSE(back.logs);
         CHECK(back.logFolder == Text("/sd0/p0/irclogs"));
+        CHECK(back.rejoin);
+        CHECK(strings(back.ignores) == strings(s.ignores));
 
         irc::AppSettings empty;
         REQUIRE(irc::readSettings("", empty, problems) == Error::Ok);

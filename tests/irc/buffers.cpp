@@ -13,6 +13,7 @@
 #include "buffers.h"
 #include "format.h"
 #include "helpers.h"
+#include "ignore.h"
 
 using irc::Buffer;
 using irc::Error;
@@ -290,4 +291,61 @@ TEST_CASE("Buffers: joins shown or not, parts and kicks, the topic, server lines
         w.buffers.close(w.buffers.network().id);
         CHECK(w.buffers.count() >= 1);
         CHECK(w.buffers.at(0).type == Buffer::Type::Network);
+}
+
+TEST_CASE("Buffers: watched people, CTCP answers, the ignored count, a refused list, ban lists, invites") {
+        World w;
+        REQUIRE(w.s.session.watch("alice") == Error::Ok);
+        w.s.say(":srv 005 jth MONITOR=10 :are supported");
+        w.s.say(":srv 376 jth :End of /MOTD");
+        w.s.takeLines();
+        Buffer *chat = w.buffers.open(Buffer::Type::Query, "alice", irc::CaseMapping::Rfc1459);
+        REQUIRE(chat != nullptr);
+        const uint32_t chatId = chat->id, network = w.buffers.network().id;
+        w.s.say(":srv 730 jth :alice!a@alice.example");
+        auto lines = w.s.takeLines();
+        REQUIRE(lines.size() == 2); // their chat, and the network's
+        CHECK(lines[0].buffer == chatId);
+        CHECK(lines[1].buffer == network);
+        CHECK(lines[1].view.find(colour("alice") + " is online (a@alice.example)") != std::string::npos);
+
+        // An answer goes where the user is; a PING's with its delay.
+        w.buffers.setActive(chatId, true);
+        w.s.say(":alice!a@alice.example NOTICE jth :\x01VERSION mIRC v7\x01");
+        lines = w.s.takeLines();
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].buffer == chatId);
+        CHECK(lines[0].view.find("'s VERSION: mIRC v7") != std::string::npos);
+
+        irc::Ignores ignores;
+        REQUIRE(ignores.read("spam") == Error::Ok);
+        w.s.session.setIgnores(&ignores, "TestNet");
+        w.s.say(":spam!s@x PRIVMSG jth :buy");
+        CHECK(w.s.takeLines().empty());
+        w.s.wait(irc::Session::IgnoredEveryMs);
+        lines = w.s.takeLines();
+        REQUIRE(!lines.empty());
+        CHECK(lines.back().view.find("1 message from people ignored") != std::string::npos);
+
+        w.s.say(":srv 322 jth #a 3 :topic");
+        w.s.say(":srv 323 jth :End");
+        CHECK(w.s.takeLines().empty()); // the list is the dialog's
+        w.s.say(":srv 263 jth LIST :Please wait a while");
+        lines = w.s.takeLines();
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].view.find("The channel list: Please wait a while") != std::string::npos);
+
+        w.s.say(":jth!u@h JOIN #bmds");
+        w.s.takeLines();
+        w.s.say(":srv 367 jth #bmds *!*@spam alice 1763289600");
+        lines = w.s.takeLines();
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].buffer == w.find("#bmds")->id);
+        CHECK(lines[0].view.find("#bmds ban: *!*@spam (by alice)") != std::string::npos);
+
+        w.s.say(":bob!b@h INVITE jth #fun");
+        lines = w.s.takeLines();
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].view.find(" invited you to #fun") != std::string::npos);
+        CHECK(lines[0].view.find("(joining)") == std::string::npos); // not set to join
 }

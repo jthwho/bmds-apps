@@ -61,6 +61,15 @@ namespace irc {
                         Text        prefixModes() const { return Text(_prefixModes); }
                         Text        prefixChars() const { return Text(_prefixChars); }
                         Text        chanTypes() const { return Text(_chanTypes); }
+                        /** @brief `ELIST`'s letters: what `LIST` filters at the server (`U`: by users). */
+                        Text elist() const { return Text(_elist); }
+                        /** @brief `MONITOR`'s limit: -1 without it, 0 without a limit. */
+                        int32_t monitor() const { return _monitor; }
+                        /** @brief `MODES`: the parameter modes one `MODE` may carry (3 by default). */
+                        uint32_t modes() const { return _modes; }
+
+                        /** @brief Returns true if @p mode is a list mode (`CHANMODES` A: bans...). */
+                        bool isListMode(char mode) const;
 
                         /** @brief Returns true if @p name is a channel's (its first character a `CHANTYPES`). */
                         bool isChannel(Text name) const;
@@ -91,6 +100,9 @@ namespace irc {
                         char        _listModes[48];   ///< CHANMODES A: lists, always a parameter.
                         char        _alwaysModes[48]; ///< B: always a parameter.
                         char        _setModes[48];    ///< C: a parameter when set.
+                        char        _elist[16];
+                        int32_t     _monitor = -1;
+                        uint32_t    _modes = 3;
         };
 
 } // namespace irc

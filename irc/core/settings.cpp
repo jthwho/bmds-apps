@@ -12,7 +12,8 @@
 
 namespace irc {
 
-        const char *const FirstNetworks =
+        // No [ in it: writeNetworks() puts the networks after it.
+        const char *const NetworksComment =
                 "# IRC's networks (devplan/irc.md §4 I3): a section a network. IRC's Network > Networks...\n"
                 "# edits this file (and writes it again); it can be edited by hand too.\n"
                 "#\n"
@@ -24,25 +25,11 @@ namespace irc {
                 "#   cert, key                 sasl-external's client certificate and key (PEM files)\n"
                 "#   ca                        more roots to trust for this network (PEM file)\n"
                 "#   channels                  joined once connected: #a, #b key\n"
+                "#   perform                   a command run once connected, before the joins (a line\n"
+                "#                             each, in order: perform = /mode $me +x)\n"
+                "#   notify                    people watched on it: a, b\n"
                 "#   autoconnect               connect at the start (yes/no)\n"
-                "\n"
-                "[Libera.Chat]\n"
-                "host = irc.libera.chat\n"
-                "port = 6697\n"
-                "tls = yes\n"
-                "nick =\n"
-                "login = none\n"
-                "channels =\n"
-                "autoconnect = no\n"
-                "\n"
-                "[OFTC]\n"
-                "host = irc.oftc.net\n"
-                "port = 6697\n"
-                "tls = yes\n"
-                "nick =\n"
-                "login = none\n"
-                "channels =\n"
-                "autoconnect = no\n";
+                "\n";
 
         namespace {
 
@@ -183,6 +170,11 @@ namespace irc {
                                 } else if (key == Text("channels")) {
                                         c.autojoin.clear();
                                         eachItem(value, [&](Text item) { (void)addItem(c.autojoin, item); });
+                                } else if (key == Text("perform")) {
+                                        if (!value.isEmpty()) (void)addItem(c.perform, value); // in order, each a line
+                                } else if (key == Text("notify")) {
+                                        n.notify.clear();
+                                        eachItem(value, [&](Text item) { (void)addItem(n.notify, item); });
                                 } else if (key == Text("cert")) {
                                         (void)n.cert.assign(value);
                                 } else if (key == Text("key")) {
@@ -235,6 +227,15 @@ namespace irc {
                                                 problem(problems, file, line, "enabled is yes or no: ", value);
                                 } else if (section == Text("logs") && key == Text("folder")) {
                                         if (!value.isEmpty()) (void)out.logFolder.assign(value);
+                                } else if (section == Text("behaviour") && key == Text("rejoin")) {
+                                        if (!yes(value, out.rejoin))
+                                                problem(problems, file, line, "rejoin is yes or no: ", value);
+                                } else if (section == Text("behaviour") && key == Text("invite")) {
+                                        if (!yes(value, out.joinInvited))
+                                                problem(problems, file, line, "invite is yes or no: ", value);
+                                } else if (section == Text("ignore") && key == Text("masks")) {
+                                        out.ignores.clear();
+                                        eachItem(value, [&](Text item) { (void)addItem(out.ignores, item); });
                                 } else {
                                         String what;
                                         (void)what.assign(section);
@@ -290,18 +291,18 @@ namespace irc {
                     t.nick.assign(f.nick) != Error::Ok || t.user.assign(f.user) != Error::Ok ||
                     t.realName.assign(f.realName) != Error::Ok || t.account.assign(f.account) != Error::Ok ||
                     t.password.assign(f.password) != Error::Ok || t.version.assign(f.version) != Error::Ok ||
-                    copyList(f.altNicks, t.altNicks) != Error::Ok || copyList(f.autojoin, t.autojoin) != Error::Ok)
+                    copyList(f.altNicks, t.altNicks) != Error::Ok || copyList(f.autojoin, t.autojoin) != Error::Ok ||
+                    copyList(f.perform, t.perform) != Error::Ok || copyList(from.notify, to.notify) != Error::Ok)
                         return Error::NoMem;
+                t.rejoin = f.rejoin;
+                t.joinInvited = f.joinInvited;
                 return Error::Ok;
         }
 
         Error writeNetworks(const Vector<NetworkSettings> &networks, String &out) {
                 static const char *const Logins[] = {"none", "sasl", "sasl-external", "nickserv", "password"};
                 out.clear();
-                // The first file's comment (its lines starting with #), then each network.
-                const Text   first = FirstNetworks;
-                const size_t end = first.find('[');
-                (void)out.append(first.left(end == Text::NoPos ? first.size() : end));
+                (void)out.append(NetworksComment);
                 for (const NetworkSettings &n : networks) {
                         char port[8];
                         snprintf(port, sizeof(port), "%u", unsigned(n.port));
@@ -323,6 +324,8 @@ namespace irc {
                         if (!n.ca.isEmpty()) line(out, "ca", n.ca);
                         if (!n.fingerprint.isEmpty()) line(out, "fingerprint", n.fingerprint);
                         list(out, "channels", n.session.autojoin);
+                        for (const String &p : n.session.perform) line(out, "perform", p);
+                        if (!n.notify.isEmpty()) list(out, "notify", n.notify);
                         line(out, "autoconnect", n.autoconnect ? "yes" : "no");
                         (void)out.append('\n');
                 }
@@ -345,7 +348,111 @@ namespace irc {
                 (void)out.append(s.logs ? "yes" : "no");
                 (void)out.append("\nfolder = ");
                 (void)out.append(s.logFolder);
-                return out.append('\n');
+                (void)out.append("\n\n[behaviour]\nrejoin = ");
+                (void)out.append(s.rejoin ? "yes" : "no");
+                (void)out.append("\ninvite = ");
+                (void)out.append(s.joinInvited ? "yes" : "no");
+                (void)out.append("\n\n[ignore]\n");
+                list(out, "masks", s.ignores);
+                return out.isEmpty() ? Error::NoMem : Error::Ok;
+        }
+
+        Error readServers(Text text, Vector<ServerEntry> &out, Vector<String> &problems) {
+                const char  *file = "servers.ini";
+                Error        err = Error::Ok;
+                ServerEntry *current = nullptr;
+                readIni(
+                        text,
+                        [&](Text section, Text key, Text value, size_t at) {
+                                if (section.isEmpty()) {
+                                        problem(problems, file, at, "not in a network's [section]");
+                                        return;
+                                }
+                                if (current == nullptr || !(current->name == section)) {
+                                        current = nullptr;
+                                        for (ServerEntry &e : out)
+                                                if (e.name == section) current = &e;
+                                        if (current == nullptr) {
+                                                ServerEntry e;
+                                                if (e.name.assign(section) != Error::Ok ||
+                                                    out.append(std::move(e)) != Error::Ok) {
+                                                        err = Error::NoMem;
+                                                        return;
+                                                }
+                                                current = &out.last();
+                                        }
+                                }
+                                ServerEntry &e = *current;
+                                if (key == Text("host")) {
+                                        (void)e.host.assign(value);
+                                } else if (key == Text("about")) {
+                                        (void)e.about.assign(value);
+                                } else if (key == Text("port")) {
+                                        unsigned v = 0;
+                                        bool     ok = !value.isEmpty() && value.size() <= 5;
+                                        for (char d : value) {
+                                                if (d < '0' || d > '9') ok = false;
+                                                v = v * 10 + unsigned(d - '0');
+                                        }
+                                        if (!ok || v == 0 || v > 65535)
+                                                problem(problems, file, at, "a port is 1 to 65535: ", value);
+                                        else
+                                                e.port = uint16_t(v);
+                                } else if (key == Text("tls")) {
+                                        if (!yes(value, e.tls))
+                                                problem(problems, file, at, "tls is yes or no: ", value);
+                                } else if (key == Text("offer")) {
+                                        if (!yes(value, e.offer))
+                                                problem(problems, file, at, "offer is yes or no: ", value);
+                                } else if (key == Text("login")) {
+                                        if (value.equalsIgnoringCase("none") || value.isEmpty())
+                                                e.login = Login::None;
+                                        else if (value.equalsIgnoringCase("sasl"))
+                                                e.login = Login::Sasl;
+                                        else if (value.equalsIgnoringCase("nickserv"))
+                                                e.login = Login::NickServ;
+                                        else
+                                                problem(problems, file, at, "login is none, sasl or nickserv: ", value);
+                                } else {
+                                        problem(problems, file, at, "not a list entry's setting: ", key);
+                                }
+                        },
+                        [&](size_t at) { problem(problems, file, at, "not [section] or key = value"); });
+                if (err != Error::Ok) return err;
+                // One without a host can't be offered: dropped, and said.
+                for (size_t i = out.size(); i > 0; --i)
+                        if (out[i - 1].host.isEmpty()) {
+                                String p;
+                                (void)p.assign("servers.ini: ");
+                                (void)p.append(out[i - 1].name);
+                                (void)p.append(": no host");
+                                (void)problems.append(std::move(p));
+                                out.removeAt(i - 1);
+                        }
+                return Error::Ok;
+        }
+
+        Error networkFrom(const ServerEntry &entry, NetworkSettings &out) {
+                out = NetworkSettings();
+                if (out.name.assign(entry.name) != Error::Ok || out.host.assign(entry.host) != Error::Ok)
+                        return Error::NoMem;
+                out.port = entry.port;
+                out.tls = entry.tls;
+                out.autoconnect = false; // until a nick is set
+                // Its login once a password is set; none until then (sasl without one: none sent).
+                out.session.login = Login::None;
+                return Error::Ok;
+        }
+
+        Error firstNetworks(const Vector<ServerEntry> &servers, String &out) {
+                Vector<NetworkSettings> nets;
+                for (const ServerEntry &e : servers) {
+                        if (!e.offer) continue;
+                        NetworkSettings n;
+                        if (networkFrom(e, n) != Error::Ok || nets.append(std::move(n)) != Error::Ok)
+                                return Error::NoMem;
+                }
+                return writeNetworks(nets, out);
         }
 
 } // namespace irc
