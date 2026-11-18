@@ -73,6 +73,22 @@ namespace irc {
                 /** @brief Writes @p bytes as base64 (SASL's) into @p out. @return `Ok` or `NoMem`. */
                 Error base64(Text bytes, String &out);
 
+                /** @brief What a NickServ notice says of a registration (devplan/irc.md §7a). */
+                enum class Registration : uint8_t {
+                        None,       ///< Not about it.
+                        Registered, ///< The nick is registered (or verified).
+                        Verify,     ///< A code was mailed: `VERIFY REGISTER nick code` to finish.
+                        Refused,    ///< It wasn't (taken already, a bad address, too soon...).
+                };
+
+                /**
+                 * @brief Reads NickServ's answer to `REGISTER` or `VERIFY` (Atheme's, as Libera's; and
+                 *        OFTC's services): "jth is now registered to ...", "Nickname jth registered.",
+                 *        "... /msg NickServ VERIFY REGISTER jth <code>", "jth has now been verified.",
+                 *        "jth is already registered.", "Invalid email address".
+                 */
+                Registration registration(Text notice);
+
                 /** @brief A moment as a calendar shows it. */
                 struct LocalTime {
                                 int year = 1970, month = 1, day = 1, hour = 0, minute = 0, second = 0;

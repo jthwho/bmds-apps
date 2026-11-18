@@ -19,7 +19,8 @@
 # multi-prefix, away-notify, extended-join, account-notify, cap-notify, chghost), SASL PLAIN
 # against the --account list, NICK (433 when taken), USER, PING/PONG, JOIN, PART, PRIVMSG,
 # NOTICE, TOPIC, NAMES, MODE (+o +v), AWAY, WHOIS, QUIT; 001-005, the MOTD.
-# NickServ: IDENTIFY [account] password (900 and a notice), GHOST nick password.
+# NickServ: IDENTIFY [account] password (900 and a notice), REGISTER password email (with
+# --verify-code, a code "mailed": VERIFY REGISTER nick code), GHOST nick password.
 # A bot, alice, in #bmds: a line every --chatter seconds, some of them mentioning whoever is
 # there; bob joins and parts now and then.
 # TestServ, for the board's tests: "KILL" closes your connection, "SILENT n" stops answering
@@ -372,8 +373,9 @@ class Bot:
 
 
 class Server:
-        def __init__(self, accounts, verbose):
+        def __init__(self, accounts, verbose, verify_code=None):
                 self.users, self.channels, self.accounts, self.verbose = {}, {}, accounts, verbose
+                self.verify_code, self.unverified = verify_code, set()
                 self.alice = Bot(self, "alice", "Alice the bot")
                 self.bob = Bot(self, "bob", "Bob the bot")
                 self.users["alice"] = self.alice
@@ -457,6 +459,28 @@ class Server:
                                 self.notice_from(ns, client, "You are now identified for %s." % account)
                         else:
                                 self.notice_from(ns, client, "Invalid password for %s." % account)
+                elif cmd == "REGISTER" and len(words) >= 3:
+                        if client.nick in self.accounts:
+                                self.notice_from(ns, client, "\x02%s\x02 is already registered." % client.nick)
+                        elif "@" not in words[2]:
+                                self.notice_from(ns, client, "Invalid email address.")
+                        else:
+                                self.accounts[client.nick] = words[1]
+                                client.account = client.nick
+                                client.reply("900", client.source(), client.nick, "You are now logged in as %s" % client.nick)
+                                self.notice_from(ns, client, "\x02%s\x02 is now registered to \x02%s\x02, with the password "
+                                                 "\x02%s\x02." % (client.nick, words[2], words[1]))
+                                if self.verify_code:
+                                        self.unverified.add(client.nick)
+                                        self.notice_from(ns, client, "An email containing nickname activation instructions has "
+                                                         "been sent to \x02%s\x02. If you do not receive it, /msg NickServ "
+                                                         "VERIFY REGISTER %s <code>" % (words[2], client.nick))
+                elif cmd == "VERIFY" and len(words) >= 4 and words[1].upper() == "REGISTER":
+                        if words[2] in self.unverified and words[3] == self.verify_code:
+                                self.unverified.discard(words[2])
+                                self.notice_from(ns, client, "\x02%s\x02 has now been verified." % words[2])
+                        else:
+                                self.notice_from(ns, client, "Verification failed. Invalid key for \x02%s\x02." % words[2])
                 elif cmd == "GHOST" and len(words) >= 3:
                         other = self.users.get(fold(words[1]))
                         if other is None or not isinstance(other, Client):
@@ -471,7 +495,8 @@ class Server:
                                         pass
                                 self.notice_from(ns, client, "%s has been ghosted." % words[1])
                 else:
-                        self.notice_from(ns, client, "Commands here: IDENTIFY [account] password, GHOST nick password.")
+                        self.notice_from(ns, client, "Commands here: IDENTIFY [account] password, REGISTER password email, "
+                                         "VERIFY REGISTER nick code, GHOST nick password.")
 
         def testserv(self, client, text):
                 ts = "TestServ!TestServ@services.%s" % SERVER
@@ -529,6 +554,7 @@ async def main():
         parser.add_argument("--account", action="append", default=[], help="NAME:PASSWORD (SASL, NickServ)")
         parser.add_argument("--chatter", type=float, default=8.0, help="seconds between alice's lines (0: none)")
         parser.add_argument("--verbose", action="store_true", help="print every line received")
+        parser.add_argument("--verify-code", help="REGISTER mails this code (VERIFY REGISTER nick CODE)")
         args = parser.parse_args()
         accounts = dict(a.split(":", 1) for a in args.account)
         work = tempfile.mkdtemp(prefix="irc-test-server-", dir=os.path.expanduser("~/.cache"))
@@ -538,7 +564,7 @@ async def main():
                 shutil.copy(os.path.join(work, "ca.pem"), os.path.join(args.out, "ca.pem"))
                 context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
                 context.load_cert_chain(os.path.join(work, "server.pem"), os.path.join(work, "server.key"))
-                server = Server(accounts, args.verbose)
+                server = Server(accounts, args.verbose, args.verify_code)
 
                 def serve(secure):
                         async def handler(reader, writer):

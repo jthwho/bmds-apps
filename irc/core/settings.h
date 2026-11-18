@@ -28,12 +28,20 @@ namespace irc {
                         String   cert;    ///< SASL EXTERNAL's client certificate (PEM file), and its key.
                         String   key;
                         String   ca; ///< More roots trusted for this network (a server with its own CA).
+                        String   fingerprint; ///< A certificate trusted by its SHA-256 ("SHA256:hex", I5): pinned.
+
+                        /** @brief Returns true if it has what connecting needs: a host and a nick. */
+                        bool isComplete() const { return !host.isEmpty() && !session.nick.isEmpty(); }
         };
+
+        /** @brief Copies @p from into @p to (the settings are move only, as their strings). @return `Ok` or `NoMem`. */
+        Error copySettings(const NetworkSettings &from, NetworkSettings &to);
 
         /** @brief The app's settings (`settings.ini`). */
         struct AppSettings {
                         Vector<String> highlights;       ///< `[highlights] words = a, b`
                         bool           showJoins = true; ///< `[view] joins = yes`
+                        bool           tree = false; ///< `[view] tree = no`: the conversations in a tree, not tabs (I7)
                         bool           logs = true;      ///< `[logs] enabled = yes`
                         String         logFolder; ///< `[logs] folder = logs` (below the data folder, or absolute)
         };
@@ -81,14 +89,21 @@ namespace irc {
         }
 
         /**
-         * @brief Reads `networks.ini` into @p out (a network a section; without a host or a nick
-         *        it is left out), each problem a line of @p problems (`networks.ini:12: ...`).
+         * @brief Reads `networks.ini` into @p out (a network a section, each kept; one without a
+         *        host or a nick isn't complete and is said), each problem a line of @p problems
+         *        (`networks.ini:12: ...`).
          * @return `Ok` or `NoMem`.
          */
         Error readNetworks(Text text, Vector<NetworkSettings> &out, Vector<String> &problems);
 
         /** @brief Reads `settings.ini` into @p out, its problems into @p problems. @return `Ok` or `NoMem`. */
         Error readSettings(Text text, AppSettings &out, Vector<String> &problems);
+
+        /** @brief Writes @p networks as `networks.ini` into @p out (read back the same). @return `Ok` or `NoMem`. */
+        Error writeNetworks(const Vector<NetworkSettings> &networks, String &out);
+
+        /** @brief Writes @p settings as `settings.ini` into @p out. @return `Ok` or `NoMem`. */
+        Error writeSettings(const AppSettings &settings, String &out);
 
         /** @brief What a new `networks.ini` holds: the first networks offered (I6), not connecting until a nick is set. */
         extern const char *const FirstNetworks;

@@ -62,6 +62,9 @@ namespace irc {
                                         Vector<String> highlights; ///< Words that count as mentions besides our nick.
                                         bool           showJoins = true;     ///< Joins, parts and quits shown.
                                         int32_t        utcOffsetMinutes = 0; ///< The zone the times are shown in.
+                                        /// Passwords hidden (`****`) where a service or the server repeats them
+                                        /// (Atheme's "registered ..., with the password secret.").
+                                        Vector<String> secrets;
                         };
 
                         /** @brief Most speakers a channel remembers. */

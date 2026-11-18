@@ -57,13 +57,22 @@ namespace irc {
                         Connection(const Connection &) = delete;
                         Connection &operator=(const Connection &) = delete;
 
+                        /** @brief How a connection's certificate is taken. */
+                        enum class Trust : uint8_t {
+                                Roots,  ///< Checked against the system's roots (and the network's ca).
+                                Pinned, ///< Its SHA-256 must be the one given (a certificate trusted, I5).
+                                Probe,  ///< Anything: only to read it (its fingerprint, to ask about it).
+                        };
+
                         /**
                          * @brief Starts connecting to @p host:@p port, with TLS if @p tls: checked
-                         *        against the system's roots and @p ca's (none: empty), presenting
-                         *        @p cert and @p key if given (SASL EXTERNAL).
+                         *        as @p trust says (@p pin: "SHA256:hex" for `Pinned`), against the
+                         *        system's roots and @p ca's (none: empty), presenting @p cert and
+                         *        @p key if given (SASL EXTERNAL).
                          * @return False if it couldn't start (`why()`).
                          */
-                        bool start(Text host, uint16_t port, bool tls, Text ca, Text cert, Text key, int64_t mono);
+                        bool start(Text host, uint16_t port, bool tls, Text ca, Text cert, Text key, Trust trust,
+                                   Text pin, int64_t mono);
 
                         /** @brief Closes it (TLS's close_notify sent if up), back to `Idle`. */
                         void stop();
@@ -79,6 +88,13 @@ namespace irc {
 
                         /** @brief Returns the server certificate's SHA-256 ("SHA256:hex"), or empty. */
                         Text fingerprint() const { return _fingerprint; }
+
+                        /** @brief Returns the server certificate's subject and issuer (once up), or empty. */
+                        Text subject() const { return _subject; }
+                        Text issuer() const { return _issuer; }
+
+                        /** @brief Returns true if the last failure was TLS's (its handshake, its check). */
+                        bool failedTls() const { return _failedTls; }
 
                         /** @brief Its fd and the events to wait for (-1: none now). */
                         int   fd() const;
@@ -117,6 +133,8 @@ namespace irc {
                         String             _security;
                         String             _cipher;
                         String             _fingerprint;
+                        String             _subject, _issuer, _pin;
+                        bool               _failedTls = false;
                         String             _out; // queued to send
                         int64_t            _deadline = -1;
         };

@@ -79,11 +79,16 @@ namespace irc {
                 return Result::Failed;
         }
 
-        bool Connection::start(Text host, uint16_t port, bool tls, Text ca, Text cert, Text key, int64_t mono) {
+        bool Connection::start(Text host, uint16_t port, bool tls, Text ca, Text cert, Text key, Trust trust, Text pin,
+                               int64_t mono) {
                 stop();
                 _why.clear();
                 _security.clear();
                 _fingerprint.clear();
+                _subject.clear();
+                _issuer.clear();
+                _failedTls = false;
+                (void)_pin.assign(trust == Trust::Pinned ? pin : Text());
                 _out.clear();
                 _wantTls = tls;
                 (void)_host.assign(host);
@@ -98,6 +103,11 @@ namespace irc {
                         if (_config == nullptr) {
                                 (void)_why.assign("no memory for TLS");
                                 return false;
+                        }
+                        // Pinned or probed: the roots' check off, the fingerprint checked after (or read).
+                        if (trust != Trust::Roots) {
+                                tls_config_insecure_noverifycert(_config);
+                                tls_config_insecure_noverifyname(_config);
                         }
                         if (!ca.isEmpty() && (path.assign(ca) != Error::Ok || path.append('\0') != Error::Ok ||
                                               tls_config_set_ca_file(_config, path.data()) != 0)) {
@@ -303,7 +313,11 @@ namespace irc {
                                         _wantWrite = r == TLS_WANT_POLLOUT;
                                         return Result::Nothing;
                                 }
-                                if (r != 0) return fail("TLS", tls_error(_tls));
+                                if (r != 0) {
+                                        const Result failed = fail("TLS", tls_error(_tls));
+                                        _failedTls = true;
+                                        return failed;
+                                }
                                 _state = State::Up;
                                 _deadline = -1;
                                 _wantWrite = false;
@@ -313,6 +327,19 @@ namespace irc {
                                 (void)_security.assign(version != nullptr ? version : "TLS");
                                 (void)_cipher.assign(cipher != nullptr ? cipher : "");
                                 if (hash != nullptr) (void)_fingerprint.assign(hash);
+                                const char *subject = tls_peer_cert_subject(_tls);
+                                const char *issuer = tls_peer_cert_issuer(_tls);
+                                (void)_subject.assign(subject != nullptr ? subject : "");
+                                (void)_issuer.assign(issuer != nullptr ? issuer : "");
+                                // A pinned certificate: this one, or none at all.
+                                if (!_pin.isEmpty() && !(_fingerprint == _pin.view())) {
+                                        String got = std::move(_fingerprint);
+                                        (void)got.append('\0');
+                                        (void)fail("the server's certificate isn't the one trusted for this network",
+                                                   got.data());
+                                        _failedTls = false; // not to be asked about again: it changed
+                                        return Result::Failed;
+                                }
                                 return Result::Connected;
                         }
 

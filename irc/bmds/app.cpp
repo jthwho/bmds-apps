@@ -9,6 +9,7 @@
 #include "app.h"
 
 #include "format.h"
+#include "util.h"
 
 #include <bmds/app.h>
 #include <bmds/sys.h>
@@ -28,39 +29,6 @@ namespace irc {
 
         namespace {
 
-                // NUL-ended, for C's calls.
-                struct CString {
-                                String s;
-                                explicit CString(Text t) {
-                                        (void)s.assign(t);
-                                        (void)s.append('\0');
-                                }
-                                const char *c() const { return s.data(); }
-                };
-
-                // A whole file's bytes into @p out. False: it isn't there (or can't be read).
-                bool readFile(const char *path, String &out) {
-                        const int fd = open(path, O_RDONLY);
-                        if (fd < 0) return false;
-                        char buf[1024];
-                        out.clear();
-                        for (;;) {
-                                const ssize_t n = read(fd, buf, sizeof(buf));
-                                if (n <= 0) break;
-                                (void)out.append(Text(buf, size_t(n)));
-                        }
-                        close(fd);
-                        return true;
-                }
-
-                bool writeFile(const char *path, Text bytes) {
-                        const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-                        if (fd < 0) return false;
-                        const bool ok = write(fd, bytes.data(), bytes.size()) == ssize_t(bytes.size());
-                        close(fd);
-                        return ok;
-                }
-
                 // A class @p cls described with entry @p entry (a property, method or event)?
                 // Its atom among the description's words: what an older firmware lacks.
                 bool hasEntry(bmds_gui_t *gui, const char *cls, const char *entry) {
@@ -75,17 +43,6 @@ namespace irc {
                                 if (v == want) return true;
                         }
                         return false;
-                }
-
-                // A path in the data folder, unless it is absolute.
-                void inData(String &out, Text dataDir, Text path) {
-                        out.clear();
-                        if (!path.startsWith("/")) {
-                                (void)out.append(dataDir);
-                                (void)out.append('/');
-                        }
-                        (void)out.append(path);
-                        return;
                 }
 
                 // A member's line in the list: its highest prefix, its nick, "(away)".
@@ -164,10 +121,7 @@ namespace irc {
                 (void)readNetworks(text, nets, _problems);
                 for (NetworkSettings &s : nets) {
                         // Files named in the data folder, unless absolute.
-                        String p;
-                        if (!s.ca.isEmpty()) inData(p, _dataDir, s.ca), (void)s.ca.assign(p);
-                        if (!s.cert.isEmpty()) inData(p, _dataDir, s.cert), (void)s.cert.assign(p);
-                        if (!s.key.isEmpty()) inData(p, _dataDir, s.key), (void)s.key.assign(p);
+                        resolvePaths(s);
                         if (s.session.version.isEmpty()) (void)s.session.version.assign("BMDS IRC 0.1");
                         auto *n = new (std::nothrow) Network(std::move(s));
                         if (n != nullptr) (void)_networks.append(std::move(n));
@@ -183,6 +137,7 @@ namespace irc {
                 const time_t t = time(nullptr);
                 struct tm    local;
                 if (localtime_r(&t, &local) != nullptr) _utcOffset = int32_t(local.tm_gmtoff / 60);
+                for (uint32_t n = 0; n < _networks.size(); ++n) updateSecrets(n);
                 for (Network *n : _networks) {
                         Buffers::Settings &b = n->buffers.settings();
                         b.showJoins = _settings.showJoins;
@@ -219,6 +174,8 @@ namespace irc {
                 bmds_menu_set_title(g, network, "&Network");
                 _connectItem = item(network, "&Connect", nullptr);
                 _disconnectItem = item(network, "&Disconnect", nullptr);
+                _networksItem = item(network, "&Networks...", nullptr);
+                _registerItem = item(network, "&Register this nick...", nullptr);
                 _quitItem = item(network, "&Quit", "Ctrl+Q");
                 const uint32_t channel = bmds_menu_new(g, bar);
                 bmds_menu_set_title(g, channel, "&Channel");
@@ -229,11 +186,17 @@ namespace irc {
                 bmds_menu_set_title(g, view, "&View");
                 _joinsItem = item(view, "&Joins and parts", nullptr);
                 bmds_menu_item_set_checked(g, _joinsItem, _settings.showJoins);
+                _treeItem = item(view, "Conversations as a &tree", nullptr);
                 const uint32_t help = bmds_menu_new(g, bar);
                 bmds_menu_set_title(g, help, "&Help");
                 _aboutItem = item(help, "&About", nullptr);
 
-                _tabs = bmds_tabs_new(g, _window);
+                // The conversations: a tree (View) beside the tabs, or the tabs alone (devplan/irc.md I7).
+                _split = bmds_splitter_new(g, _window);
+                bmds_splitter_set_direction(g, _split, "across");
+                bmds_widget_set_stretch(g, _split, 1);
+                _tree = bmds_tree_view_new(g, _split);
+                _tabs = bmds_tabs_new(g, _split);
                 bmds_widget_set_stretch(g, _tabs, 1);
 
                 // The input line: the nick (a click: /nick), the line taking Tab, Up and Down.
@@ -252,24 +215,32 @@ namespace irc {
                 bmds_status_bar_add_field(g, _status, 0, nullptr);
                 _clipboard = bmds_clipboard_new(g, 0);
 
+                // The tray: a click shows the window; marked while mentions wait (devplan/irc.md §6).
+                _tray = bmds_tray_icon_new(g, 0);
+                bmds_tray_icon_set_icon(g, _tray, "mail-send");
+                bmds_tray_icon_set_tool_tip(g, _tray, "IRC");
+                bmds_tray_icon_set_category(g, _tray, "communications");
+                const uint32_t trayMenu = bmds_menu_new(g, _tray);
+                _trayShow = item(trayMenu, "&Show IRC", nullptr);
+                _trayQuit = item(trayMenu, "&Quit", nullptr);
+                bmds_tray_icon_set_visible(g, _tray, 1);
+                setTree(_settings.tree);
+
                 // Each network's own tab first; the settings' problems in the first.
                 if (_networks.isEmpty()) {
                         Page *p = page(NoNetwork, 0, true);
-                        if (p != nullptr) {
-                                bmds_chat_view_append(g, p->chat, "--\x0f\tNo network can connect yet.");
-                                String path;
-                                inData(path, _dataDir, "networks.ini");
-                                String line;
-                                (void)line.assign("--\x0f\tSet your nick in ");
-                                (void)line.append(path);
-                                (void)line.append(", and autoconnect = yes, then start IRC again.");
-                                bmds_chat_view_append(g, p->chat, CString(line).c());
-                        }
+                        if (p != nullptr)
+                                bmds_chat_view_append(g, p->chat,
+                                                      "--\x0f\tNo network yet: add one in Network > Networks...");
                 }
                 for (uint32_t n = 0; n < _networks.size(); ++n) syncPages(n);
                 for (const String &problem : _problems) note(problem);
                 bmds_window_show(g, _window);
                 bmds_widget_set_focus(g, _entry);
+                // None can connect (a first start: no nick yet): the Networks dialog, to set one (I6).
+                bool ready = false;
+                for (const Network *net : _networks) ready = ready || net->settings.isComplete();
+                if (!ready) openNetworks();
                 return;
         }
 
@@ -285,7 +256,7 @@ namespace irc {
                 loadSettings();
                 buildWindow();
                 for (uint32_t n = 0; n < _networks.size(); ++n)
-                        if (_networks[n]->settings.autoconnect) connect(n);
+                        if (_networks[n]->settings.autoconnect && _networks[n]->settings.isComplete()) connect(n);
                 updateStatus();
                 while (!_done) pollOnce();
                 _logs.flush();
@@ -313,6 +284,7 @@ namespace irc {
                 };
                 for (uint32_t n = 0; n < _networks.size() && count < 9; ++n) {
                         Network &net = *_networks[n];
+                        if (net.removed) continue;
                         if (net.connection.fd() >= 0) {
                                 fds[count] = {net.connection.fd(), net.connection.events(), 0};
                                 owner[count++] = n;
@@ -353,17 +325,29 @@ namespace irc {
                 Network &net = *_networks[n];
                 net.wanted = true;
                 net.reconnectAt = -1;
-                if (net.connection.state() != Connection::State::Idle) return;
+                if (net.connection.state() != Connection::State::Idle || net.removed) return;
                 const NetworkSettings &s = net.settings;
-                char                   what[160];
-                snprintf(what, sizeof(what), "Connecting to %.*s:%u%s", int(s.host.size()), s.host.data(),
-                         unsigned(s.port), s.tls ? " (TLS)" : " (no TLS)");
-                Vector<Line> lines;
+                Vector<Line>           lines;
+                if (!s.isComplete()) {
+                        net.wanted = false;
+                        (void)net.buffers.note(net.buffers.network().id,
+                                               "Can't connect: no server or nick yet (Network > Networks...)",
+                                               now().wall, lines);
+                        show(n, lines);
+                        return;
+                }
+                char what[160];
+                snprintf(what, sizeof(what), "%s %.*s:%u%s",
+                         net.probing ? "Reading the certificate of" : "Connecting to", int(s.host.size()),
+                         s.host.data(), unsigned(s.port), s.tls ? " (TLS)" : " (no TLS)");
                 (void)net.buffers.note(net.buffers.network().id, what, now().wall, lines);
                 show(n, lines);
-                const bool external = s.session.login == Login::SaslExternal;
+                const bool              external = s.session.login == Login::SaslExternal;
+                const Connection::Trust trust = net.probing                ? Connection::Trust::Probe
+                                                : !s.fingerprint.isEmpty() ? Connection::Trust::Pinned
+                                                                           : Connection::Trust::Roots;
                 if (!net.connection.start(s.host, s.port, s.tls, s.ca, external ? s.cert.view() : Text(),
-                                          external ? s.key.view() : Text(), now().mono))
+                                          external ? s.key.view() : Text(), trust, s.fingerprint, now().mono))
                         disconnect(n, CString(net.connection.why()).c(), true);
                 updateStatus();
                 return;
@@ -406,6 +390,13 @@ namespace irc {
                 switch (net.connection.service(revents, t.mono, buf, sizeof(buf), got)) {
                         case Connection::Result::Nothing: break;
                         case Connection::Result::Connected: {
+                                if (net.probing) {
+                                        // Only to read it: closed, and the user asked whether to trust it.
+                                        net.probing = false;
+                                        net.connection.stop(); // its fingerprint, subject and issuer kept
+                                        askTrust(n);
+                                        break;
+                                }
                                 Vector<Line> lines;
                                 String       text;
                                 (void)text.assign("Connected (");
@@ -425,7 +416,24 @@ namespace irc {
                                 net.reader.feed(Text(buf, got), [&](Text line) { net.session.received(line, t); });
                                 break;
                         case Connection::Result::Closed:
-                        case Connection::Result::Failed: disconnect(n, CString(net.connection.why()).c(), true); break;
+                        case Connection::Result::Failed:
+                                // TLS's check refused the certificate: read it, to ask the user (I5).
+                                if (net.connection.failedTls() && net.settings.tls &&
+                                    net.settings.fingerprint.isEmpty() && !net.probing && _trustBox == 0) {
+                                        Vector<Line> lines;
+                                        String       text;
+                                        (void)text.assign("The server's certificate isn't trusted (");
+                                        (void)text.append(net.connection.why());
+                                        (void)text.append(")");
+                                        (void)net.buffers.note(net.buffers.network().id, text, t.wall, lines);
+                                        show(n, lines);
+                                        net.probing = true;
+                                        connect(n);
+                                        break;
+                                }
+                                net.probing = false;
+                                disconnect(n, CString(net.connection.why()).c(), true);
+                                break;
                 }
                 pump(n);
                 updateStatus();
@@ -444,7 +452,7 @@ namespace irc {
                 while (net.session.takeEvent(e)) {
                         Vector<Line> lines;
                         (void)net.buffers.apply(e, net.session, lines);
-                        show(n, lines);
+                        show(n, lines, &e);
                         react(n, e);
                         any = true;
                 }
@@ -478,6 +486,7 @@ namespace irc {
                                 }
                                 break;
                         case Event::Kind::Timeout: disconnect(n, "no answer from the server", true); break;
+                        case Event::Kind::Notice: registration(n, e); break;
                         case Event::Kind::Lag: updateStatus(); break;
                         default: break;
                 }
@@ -504,13 +513,24 @@ namespace irc {
                         p.chat = bmds_chat_view_new(g, split);
                         p.members = bmds_list_view_new(g, split);
                         bmds_splitter_set_position(g, split, 640);
+                        bmds_splitter_set_min_second(g, split, 140); // the members readable, the tree shown or not
                 } else {
                         p.chat = bmds_chat_view_new(g, p.tab);
                         bmds_widget_set_stretch(g, p.chat, 1);
                 }
                 bmds_tab_page_set_closable(g, p.tab, b != nullptr && b->type != Buffer::Type::Network);
-                if (_pages.append(std::move(p)) != Error::Ok) return nullptr;
-                Page &made = _pages.last();
+                if (p.topic != 0) bmds_widget_set_visible(g, p.topic, 0); // until there is a topic
+                // After its network's last tab (several networks: each one's together).
+                size_t at = _pages.size();
+                for (size_t i = 0; i < _pages.size(); ++i)
+                        if (_pages[i].network == n) at = i + 1;
+                const uint32_t tab = p.tab;
+                if (_pages.insert(at, std::move(p)) != Error::Ok) return nullptr;
+                if (at + 1 < _pages.size()) {
+                        bmds_tab_page_set_index(g, tab, int32_t(at));
+                        if (at <= _current) ++_current; // the current page moved along
+                }
+                Page &made = _pages[at];
                 if (b != nullptr && b->type == Buffer::Type::Channel) {
                         refreshTopic(n, b->name);
                         refreshMembers(n, b->name);
@@ -524,13 +544,18 @@ namespace irc {
                 return nullptr;
         }
 
-        void App::show(uint32_t n, Vector<Line> &lines) {
+        void App::show(uint32_t n, Vector<Line> &lines, const Event *event) {
                 Network &net = *_networks[n];
                 for (const Line &l : lines) {
                         Page *p = page(n, l.buffer, true);
                         if (p == nullptr) continue;
-                        bmds_chat_view_append(_gui, p->chat, CString(l.view).c());
                         const Buffer *b = net.buffers.byId(l.buffer);
+                        // The first line not read: the marker under what was ("new since you looked").
+                        if (l.level >= 1 && b != nullptr && b->unread == 1 &&
+                            !(net.buffers.active() == l.buffer && _focused))
+                                bmds_chat_view_set_marker(_gui, p->chat, "new since you looked");
+                        bmds_chat_view_append(_gui, p->chat, CString(l.view).c());
+                        if (l.notify && event != nullptr) notify(n, *event, l);
                         _logs.write(net.settings.name, l.buffer, b != nullptr ? b->name.view() : Text(), l, _utcOffset);
                         if (_flushAt < 0) _flushAt = now().mono + Logs::FlushMs;
                 }
@@ -540,6 +565,7 @@ namespace irc {
 
         void App::syncPages(uint32_t n) {
                 Network &net = *_networks[n];
+                if (net.removed) return;
                 for (size_t i = 0; i < net.buffers.count(); ++i) {
                         const Buffer &b = net.buffers.at(i);
                         Page         *p = page(n, b.id, true);
@@ -553,15 +579,238 @@ namespace irc {
                         char badge[8] = {};
                         if (b.unread > 0)
                                 snprintf(badge, sizeof(badge), "%u", b.unread > 999 ? 999u : unsigned(b.unread));
+                        String path;
+                        treePath(*p, path);
                         if (!(p->badge == Text(badge))) {
                                 (void)p->badge.assign(badge);
                                 bmds_tab_page_set_badge(_gui, p->tab, badge);
+                                bmds_tree_view_set_badge(_gui, _tree, CString(path).c(), badge);
                         }
                         if (p->attention != b.attention) {
                                 p->attention = b.attention;
                                 bmds_tab_page_set_attention(_gui, p->tab, b.attention);
+                                bmds_tree_view_set_attention(_gui, _tree, CString(path).c(), b.attention);
                         }
                 }
+                // The tree: the network's row, its conversations under it in the tabs' order.
+                String kids;
+                for (const Page &p : _pages)
+                        if (p.network == n && !(p.title == net.settings.name.view())) {
+                                (void)kids.append(p.title);
+                                (void)kids.append('\n');
+                        }
+                const CString root(net.settings.name);
+                if (!net.treeRoot) {
+                        bmds_tree_view_add_root(_gui, _tree, root.c());
+                        net.treeRoot = true;
+                }
+                if (!(net.treeKids == kids.view())) {
+                        Vector<String>       names;
+                        Vector<const char *> list;
+                        size_t               at = 0;
+                        while (at < kids.size()) {
+                                const size_t end = kids.view().find('\n', at);
+                                String       name;
+                                (void)name.assign(kids.view().mid(at, end - at));
+                                (void)name.append('\0');
+                                (void)names.append(std::move(name));
+                                at = end + 1;
+                        }
+                        for (const String &name : names) {
+                                const char *c = name.data();
+                                (void)list.append(std::move(c));
+                        }
+                        bmds_tree_view_set_children(_gui, _tree, root.c(), list.isEmpty() ? nullptr : list.begin(),
+                                                    uint32_t(list.size()));
+                        for (const String &name : names) {
+                                String path;
+                                (void)path.assign(net.settings.name);
+                                (void)path.append('/');
+                                (void)path.append(name.view().left(name.size() - 1));
+                                bmds_tree_view_set_has_children(_gui, _tree, CString(path).c(), 0);
+                        }
+                        bmds_tree_view_expand(_gui, _tree, root.c());
+                        net.treeKids = std::move(kids);
+                }
+                updateTray();
+                return;
+        }
+
+        void App::updateSecrets(uint32_t n) {
+                // The passwords a service may repeat: the network's, and one being registered.
+                Network        &net = *_networks[n];
+                Vector<String> &secrets = net.buffers.settings().secrets;
+                secrets.clear();
+                const Text candidates[] = {net.settings.session.password.view(), net.registerPassword.view()};
+                for (Text secret : candidates) {
+                        String s;
+                        if (!secret.isEmpty() && s.assign(secret) == Error::Ok) (void)secrets.append(std::move(s));
+                }
+                return;
+        }
+
+        void App::resolvePaths(NetworkSettings &s) const {
+                // The files a network names, in the data folder unless absolute.
+                String p;
+                if (!s.ca.isEmpty()) inData(p, _dataDir, s.ca), (void)s.ca.assign(p);
+                if (!s.cert.isEmpty()) inData(p, _dataDir, s.cert), (void)s.cert.assign(p);
+                if (!s.key.isEmpty()) inData(p, _dataDir, s.key), (void)s.key.assign(p);
+                return;
+        }
+
+        void App::saveNetworks() {
+                Vector<NetworkSettings> all;
+                for (const Network *net : _networks) {
+                        if (net->removed) continue;
+                        NetworkSettings copy;
+                        if (copySettings(net->settings, copy) != Error::Ok) return;
+                        // Paths as typed (relative to the data folder), not as resolved for connecting.
+                        const auto relative = [&](String &path) {
+                                if (path.view().startsWith(_dataDir.view()) && path.size() > _dataDir.size() &&
+                                    path.view()[_dataDir.size()] == '/')
+                                        (void)path.assign(path.view().mid(_dataDir.size() + 1));
+                        };
+                        relative(copy.ca);
+                        relative(copy.cert);
+                        relative(copy.key);
+                        (void)all.append(std::move(copy));
+                }
+                String path, text;
+                inData(path, _dataDir, "networks.ini");
+                if (writeNetworks(all, text) != Error::Ok || !writeFile(CString(path).c(), text))
+                        note("Couldn't save networks.ini");
+                return;
+        }
+
+        void App::resetTree() {
+                // A network renamed or taken out: the tree made again (its rows go by name).
+                bmds_tree_view_clear(_gui, _tree);
+                for (Network *net : _networks) {
+                        net->treeRoot = false;
+                        net->treeKids.clear();
+                }
+                for (uint32_t n = 0; n < _networks.size(); ++n) syncPages(n);
+                for (Page &p : _pages) p.badge.clear(), p.attention = 0; // marks set again
+                for (uint32_t n = 0; n < _networks.size(); ++n) syncPages(n);
+                return;
+        }
+
+        void App::askTrust(uint32_t n) {
+                Network &net = *_networks[n];
+                if (_trustBox != 0) bmds_gui_destroy(_gui, _trustBox);
+                char text[900];
+                snprintf(text, sizeof(text),
+                         "The certificate %.*s presented isn't trusted: its issuer isn't among the system's roots, or "
+                         "it is for another name.\n\nSubject: %.*s\nIssuer: %.*s\nFingerprint: %.*s\n\n"
+                         "Trust this certificate for %.*s? IRC then checks it by its fingerprint each time (a "
+                         "different one is refused).",
+                         int(net.settings.host.size()), net.settings.host.data(), int(net.connection.subject().size()),
+                         net.connection.subject().data(), int(net.connection.issuer().size()),
+                         net.connection.issuer().data(), int(net.connection.fingerprint().size()),
+                         net.connection.fingerprint().data(), int(net.settings.name.size()), net.settings.name.data());
+                _trustBox = bmds_message_box_new(_gui, _window);
+                _trustNetwork = n;
+                bmds_message_box_set_kind(_gui, _trustBox, "question");
+                bmds_message_box_set_title(_gui, _trustBox, "A certificate not trusted");
+                bmds_message_box_set_text(_gui, _trustBox, text);
+                bmds_message_box_set_buttons(_gui, _trustBox, "yesNo");
+                bmds_message_box_open(_gui, _trustBox);
+                showWindow();
+                return;
+        }
+
+        void App::treePath(const Page &p, String &out) const {
+                out.clear();
+                if (p.network == NoNetwork) return;
+                const Network &net = *_networks[p.network];
+                (void)out.assign(net.settings.name);
+                if (!(p.title == net.settings.name.view())) {
+                        (void)out.append('/');
+                        (void)out.append(p.title);
+                }
+                return;
+        }
+
+        void App::updateTray() {
+                int mentions = 0;
+                for (const Network *net : _networks)
+                        for (size_t i = 0; i < net->buffers.count(); ++i) mentions += int(net->buffers.at(i).mentions);
+                if (mentions == _trayMentions) return;
+                _trayMentions = mentions;
+                char tip[64];
+                if (mentions > 0)
+                        snprintf(tip, sizeof(tip), "IRC: %d mention%s or private message%s", mentions,
+                                 mentions == 1 ? "" : "s", mentions == 1 ? "" : "s");
+                else
+                        snprintf(tip, sizeof(tip), "IRC");
+                bmds_tray_icon_set_icon(_gui, _tray, mentions > 0 ? "emblem-important" : "mail-send");
+                bmds_tray_icon_set_tool_tip(_gui, _tray, tip);
+                return;
+        }
+
+        void App::notify(uint32_t n, const Event &e, const Line &line) {
+                Network      &net = *_networks[n];
+                const Buffer *b = net.buffers.byId(line.buffer);
+                if (b == nullptr) return;
+                // One a conversation: the newer replaces the older.
+                for (size_t i = 0; i < _notes.size(); ++i)
+                        if (_notes[i].network == n && _notes[i].buffer == line.buffer) {
+                                bmds_gui_destroy(_gui, _notes[i].id);
+                                _notes.removeAt(i);
+                                break;
+                        }
+                char title[128];
+                if (b->type == Buffer::Type::Channel)
+                        snprintf(title, sizeof(title), "%.*s in %.*s", int(e.nick.size()), e.nick.data(),
+                                 int(b->name.size()), b->name.data());
+                else
+                        snprintf(title, sizeof(title), "%.*s", int(e.nick.size()), e.nick.data());
+                String body, plain;
+                if ((e.flags & Event::Action) != 0) {
+                        (void)body.assign("* ");
+                        (void)body.append(e.nick);
+                        (void)body.append(' ');
+                }
+                (void)Format::strip(e.text, plain);
+                (void)body.append(plain);
+                const uint32_t id = bmds_notification_new(_gui, 0);
+                bmds_notification_set_title(_gui, id, title);
+                bmds_notification_set_body(_gui, id, CString(body).c());
+                bmds_notification_set_app(_gui, id, "IRC");
+                bmds_notification_set_icon(_gui, id, "mail-send");
+                static const char *const actions[] = {"Open"};
+                bmds_notification_set_actions(_gui, id, actions, 1);
+                bmds_notification_show(_gui, id);
+                Note note;
+                note.id = id;
+                note.network = n;
+                note.buffer = line.buffer;
+                (void)_notes.append(std::move(note));
+                return;
+        }
+
+        void App::showWindow() {
+                bmds_gui_value_t v;
+                if (bmds_window_get_minimized(_gui, _window, &v) == 0 && v.number != 0)
+                        bmds_window_restore(_gui, _window);
+                bmds_window_raise(_gui, _window);
+                return;
+        }
+
+        void App::setTree(bool tree) {
+                _settings.tree = tree;
+                bmds_widget_set_visible(_gui, _tree, tree);
+                bmds_tabs_set_bar_visible(_gui, _tabs, !tree);
+                bmds_splitter_set_position(_gui, _split, tree ? 180 : 0);
+                bmds_menu_item_set_checked(_gui, _treeItem, tree);
+                return;
+        }
+
+        void App::saveSettings() {
+                String path, text;
+                inData(path, _dataDir, "settings.ini");
+                if (writeSettings(_settings, text) != Error::Ok) return;
+                if (!writeFile(CString(path).c(), text)) note("Couldn't save settings.ini");
                 return;
         }
 
@@ -593,6 +842,9 @@ namespace irc {
                         syncPages(n);
                 }
                 _completer.reset();
+                String path;
+                treePath(p, path);
+                if (!path.isEmpty()) bmds_tree_view_set_current(_gui, _tree, CString(path).c());
                 updateStatus();
                 return;
         }
@@ -641,6 +893,7 @@ namespace irc {
                 String plain;
                 if (c != nullptr) (void)Format::strip(c->topic, plain);
                 bmds_label_set_text(_gui, p->topic, CString(plain).c());
+                bmds_widget_set_visible(_gui, p->topic, !plain.isEmpty()); // no empty bar
                 return;
         }
 
@@ -804,7 +1057,11 @@ namespace irc {
         void App::menu(uint32_t id) {
                 const Page    *p = _pages.isEmpty() || _current >= _pages.size() ? nullptr : &_pages[_current];
                 const uint32_t n = p != nullptr ? p->network : NoNetwork;
-                if (id == _connectItem) {
+                if (id == _networksItem) {
+                        openNetworks();
+                } else if (id == _registerItem) {
+                        openRegister();
+                } else if (id == _connectItem) {
                         if (n != NoNetwork) connect(n);
                 } else if (id == _disconnectItem) {
                         if (n != NoNetwork) {
@@ -831,6 +1088,14 @@ namespace irc {
                         _settings.showJoins = !_settings.showJoins;
                         bmds_menu_item_set_checked(_gui, _joinsItem, _settings.showJoins);
                         for (Network *net : _networks) net->buffers.settings().showJoins = _settings.showJoins;
+                        saveSettings();
+                } else if (id == _treeItem) {
+                        setTree(!_settings.tree);
+                        saveSettings();
+                } else if (id == _trayShow) {
+                        showWindow();
+                } else if (id == _trayQuit) {
+                        quit();
                 } else if (id == _aboutItem) {
                         const uint32_t box = bmds_message_box_new(_gui, _window);
                         bmds_message_box_set_kind(_gui, box, "information");
@@ -883,8 +1148,57 @@ namespace irc {
                         setCurrent(size_t(e.values[0].number), false);
                         return;
                 }
+                if (dialogEvent(e)) return;
+                if (e.source == _trustBox && _trustBox != 0) {
+                        const uint32_t n = _trustNetwork;
+                        const char    *answer =
+                                e.count == 1 ? bmds_gui_atom_name(g, uint32_t(e.values[0].number)) : nullptr;
+                        bmds_gui_destroy(g, _trustBox);
+                        _trustBox = 0;
+                        if (n < _networks.size()) {
+                                Network &net = *_networks[n];
+                                if (answer != nullptr && strcmp(answer, "yes") == 0) {
+                                        // Trusted by its fingerprint from now on, kept in networks.ini.
+                                        (void)net.settings.fingerprint.assign(net.connection.fingerprint());
+                                        saveNetworks();
+                                        connect(n);
+                                } else {
+                                        disconnect(n, "the certificate wasn't trusted", false);
+                                }
+                        }
+                        return;
+                }
                 if (bmds_gui_event_is(g, &e, BMDS_GUI_MENU_ITEM_CHOSEN)) {
                         menu(e.source);
+                        return;
+                }
+                if (e.source == _tree && bmds_gui_event_is(g, &e, BMDS_GUI_TREE_VIEW_CURRENT_CHANGED) && e.count == 1) {
+                        // A row chosen: its page shown.
+                        const Text want(e.values[0].text, e.values[0].length);
+                        for (size_t i = 0; i < _pages.size(); ++i) {
+                                String path;
+                                treePath(_pages[i], path);
+                                if (path == want) setCurrent(i, true);
+                        }
+                        return;
+                }
+                if (e.source == _tray && bmds_gui_event_is(g, &e, BMDS_GUI_TRAY_ICON_ACTIVATED)) {
+                        const char *how = e.count == 1 ? bmds_gui_atom_name(g, uint32_t(e.values[0].number)) : nullptr;
+                        if (how == nullptr || strcmp(how, "context") != 0) showWindow(); // a right click: its menu
+                        return;
+                }
+                for (size_t i = 0; i < _notes.size(); ++i) {
+                        if (_notes[i].id != e.source) continue;
+                        if (bmds_gui_event_is(g, &e, BMDS_GUI_NOTIFICATION_ACTIVATED)) {
+                                // Open: its conversation shown.
+                                for (size_t k = 0; k < _pages.size(); ++k)
+                                        if (_pages[k].network == _notes[i].network &&
+                                            _pages[k].buffer == _notes[i].buffer)
+                                                setCurrent(k, true);
+                                showWindow();
+                        }
+                        bmds_gui_destroy(g, _notes[i].id);
+                        _notes.removeAt(i);
                         return;
                 }
                 Page *p = pageOf(e.source);

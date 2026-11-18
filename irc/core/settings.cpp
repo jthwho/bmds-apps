@@ -8,11 +8,13 @@
 
 #include "settings.h"
 
+#include <cstdio>
+
 namespace irc {
 
         const char *const FirstNetworks =
-                "# IRC's networks (devplan/irc.md §4 I3): a section a network. Set your nick and\n"
-                "# autoconnect = yes, then Network > Connect.\n"
+                "# IRC's networks (devplan/irc.md §4 I3): a section a network. IRC's Network > Networks...\n"
+                "# edits this file (and writes it again); it can be edited by hand too.\n"
                 "#\n"
                 "#   host, port, tls (yes/no)  where it is (TLS on 6697 by default)\n"
                 "#   nick, altnicks            your nick, and others to try (a, b)\n"
@@ -187,20 +189,20 @@ namespace irc {
                                         (void)n.key.assign(value);
                                 } else if (key == Text("ca")) {
                                         (void)n.ca.assign(value);
+                                } else if (key == Text("fingerprint")) {
+                                        (void)n.fingerprint.assign(value);
                                 } else {
                                         problem(problems, file, line, "not a network's setting: ", key);
                                 }
                         },
                         [&](size_t line) { problem(problems, file, line, "not [section] or key = value"); });
                 if (err != Error::Ok) return err;
-                // A network without a host or a nick can't connect: left out, and said.
+                // A network without a host or a nick can't connect: kept (to be filled in), and said.
                 for (size_t i = out.size(); i > 0; --i) {
                         NetworkSettings &n = out[i - 1];
                         if (n.host.isEmpty() || n.session.nick.isEmpty()) {
                                 problem(problems, file, firstLines[i - 1], n.name,
                                         n.host.isEmpty() ? Text(": no host") : Text(": no nick (set one to connect)"));
-                                out.removeAt(i - 1);
-                                firstLines.removeAt(i - 1);
                         } else if (n.session.login == Login::SaslExternal && (n.cert.isEmpty() || n.key.isEmpty())) {
                                 problem(problems, file, firstLines[i - 1], n.name,
                                         ": sasl-external needs cert and key (the client certificate)");
@@ -222,6 +224,9 @@ namespace irc {
                                 if (section == Text("view") && key == Text("joins")) {
                                         if (!yes(value, out.showJoins))
                                                 problem(problems, file, line, "joins is yes or no: ", value);
+                                } else if (section == Text("view") && key == Text("tree")) {
+                                        if (!yes(value, out.tree))
+                                                problem(problems, file, line, "tree is yes or no: ", value);
                                 } else if (section == Text("highlights") && key == Text("words")) {
                                         out.highlights.clear();
                                         eachItem(value, [&](Text item) { (void)addItem(out.highlights, item); });
@@ -240,6 +245,107 @@ namespace irc {
                         },
                         [&](size_t line) { problem(problems, file, line, "not [section] or key = value"); });
                 return Error::Ok;
+        }
+
+        namespace {
+
+                Error copyList(const Vector<String> &from, Vector<String> &to) {
+                        to.clear();
+                        for (const String &s : from)
+                                if (addItem(to, s) != Error::Ok) return Error::NoMem;
+                        return Error::Ok;
+                }
+
+                void line(String &out, const char *key, Text value) {
+                        (void)out.append(key);
+                        (void)out.append(" = ");
+                        (void)out.append(value);
+                        (void)out.append('\n');
+                        return;
+                }
+
+                void list(String &out, const char *key, const Vector<String> &items) {
+                        (void)out.append(key);
+                        (void)out.append(" =");
+                        for (size_t i = 0; i < items.size(); ++i) {
+                                (void)out.append(i == 0 ? " " : ", ");
+                                (void)out.append(items[i]);
+                        }
+                        (void)out.append('\n');
+                        return;
+                }
+
+        } // namespace
+
+        Error copySettings(const NetworkSettings &from, NetworkSettings &to) {
+                const Config &f = from.session;
+                Config       &t = to.session;
+                to.port = from.port;
+                to.tls = from.tls;
+                to.autoconnect = from.autoconnect;
+                t.login = f.login;
+                if (to.name.assign(from.name) != Error::Ok || to.host.assign(from.host) != Error::Ok ||
+                    to.cert.assign(from.cert) != Error::Ok || to.key.assign(from.key) != Error::Ok ||
+                    to.ca.assign(from.ca) != Error::Ok || to.fingerprint.assign(from.fingerprint) != Error::Ok ||
+                    t.nick.assign(f.nick) != Error::Ok || t.user.assign(f.user) != Error::Ok ||
+                    t.realName.assign(f.realName) != Error::Ok || t.account.assign(f.account) != Error::Ok ||
+                    t.password.assign(f.password) != Error::Ok || t.version.assign(f.version) != Error::Ok ||
+                    copyList(f.altNicks, t.altNicks) != Error::Ok || copyList(f.autojoin, t.autojoin) != Error::Ok)
+                        return Error::NoMem;
+                return Error::Ok;
+        }
+
+        Error writeNetworks(const Vector<NetworkSettings> &networks, String &out) {
+                static const char *const Logins[] = {"none", "sasl", "sasl-external", "nickserv", "password"};
+                out.clear();
+                // The first file's comment (its lines starting with #), then each network.
+                const Text   first = FirstNetworks;
+                const size_t end = first.find('[');
+                (void)out.append(first.left(end == Text::NoPos ? first.size() : end));
+                for (const NetworkSettings &n : networks) {
+                        char port[8];
+                        snprintf(port, sizeof(port), "%u", unsigned(n.port));
+                        (void)out.append('[');
+                        (void)out.append(n.name);
+                        (void)out.append("]\n");
+                        line(out, "host", n.host);
+                        line(out, "port", port);
+                        line(out, "tls", n.tls ? "yes" : "no");
+                        line(out, "nick", n.session.nick);
+                        list(out, "altnicks", n.session.altNicks);
+                        line(out, "user", n.session.user);
+                        line(out, "realname", n.session.realName);
+                        line(out, "login", Logins[size_t(n.session.login) < 5 ? size_t(n.session.login) : 0]);
+                        line(out, "account", n.session.account);
+                        line(out, "password", n.session.password);
+                        if (!n.cert.isEmpty()) line(out, "cert", n.cert);
+                        if (!n.key.isEmpty()) line(out, "key", n.key);
+                        if (!n.ca.isEmpty()) line(out, "ca", n.ca);
+                        if (!n.fingerprint.isEmpty()) line(out, "fingerprint", n.fingerprint);
+                        list(out, "channels", n.session.autojoin);
+                        line(out, "autoconnect", n.autoconnect ? "yes" : "no");
+                        (void)out.append('\n');
+                }
+                return out.isEmpty() ? Error::NoMem : Error::Ok;
+        }
+
+        Error writeSettings(const AppSettings &s, String &out) {
+                out.clear();
+                (void)out.append("# IRC's settings (devplan/irc.md I3), written by IRC: its View menu keeps them.\n\n"
+                                 "[view]\njoins = ");
+                (void)out.append(s.showJoins ? "yes" : "no");
+                (void)out.append("\ntree = ");
+                (void)out.append(s.tree ? "yes" : "no");
+                (void)out.append("\n\n[highlights]\nwords = ");
+                for (size_t i = 0; i < s.highlights.size(); ++i) {
+                        if (i > 0) (void)out.append(", ");
+                        (void)out.append(s.highlights[i]);
+                }
+                (void)out.append("\n\n[logs]\nenabled = ");
+                (void)out.append(s.logs ? "yes" : "no");
+                (void)out.append("\nfolder = ");
+                (void)out.append(s.logFolder);
+                return out.append('\n');
         }
 
 } // namespace irc

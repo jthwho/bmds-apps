@@ -218,6 +218,28 @@ namespace irc {
                 }
 
 
+                Registration registration(Text notice) {
+                        String plain;
+                        if (strip(notice, plain) != Error::Ok) return Registration::None;
+                        // Lower case, to look for words in.
+                        String lower;
+                        for (char c : plain.view()) (void)lower.append(c >= 'A' && c <= 'Z' ? char(c + 32) : c);
+                        const auto has = [&](const char *words) {
+                                const Text w(words), t = lower;
+                                for (size_t i = 0; i + w.size() <= t.size(); ++i)
+                                        if (t.mid(i, w.size()) == w) return true;
+                                return false;
+                        };
+                        if (has("verify register")) return Registration::Verify;
+                        if (has("already registered") || has("not registered") || has("invalid") || has("you must") ||
+                            has("too many") || has("cannot") || has("failed") || has("isn't") || has("is not"))
+                                return Registration::Refused;
+                        if (has("is now registered") || has("registered.") || has("has now been verified") ||
+                            has("is now verified") || (has("registration") && has("complete")))
+                                return Registration::Registered;
+                        return Registration::None;
+                }
+
                 LocalTime localTime(int64_t utcMs, int32_t offsetMinutes) {
                         // Floor division: times before 1970 too.
                         const int64_t ms = utcMs + int64_t(offsetMinutes) * 60000;

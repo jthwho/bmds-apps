@@ -7,7 +7,9 @@ release, which brings what it needs: TLS sockets (`tls_ctl`, network.md §35) an
 
 Status: **step 0 built in BMDS** (`ChatView`: its chatview.md §7-§9; the tabs' additions: its
 tabs.md §7-§9; the input line's keys: its chatview.md §10); **steps 1 to 3 built** (§12; §13,
-§14: the core; §15: the app, against `tools/irc-test-server`, then Libera.Chat); step 4 next.
+§14: the core; §15: the app, against `tools/irc-test-server`, then Libera.Chat); **step 4
+built** (§16: several networks, the tree, notifications, the tray, the marker; §17: the Networks
+dialog, registering a nick, pinning a fingerprint); step 5, the release, after BMDS's next.
 Paths below are this repository's unless they name BMDS.
 
 ## 1. Goal
@@ -465,3 +467,76 @@ too), inside §8's estimate.
 - **Not yet:** step 4's Networks dialog, nick registration, several networks shown, the tree
   view, notifications and the tray, pinning a fingerprint, and the marker ("new since") on going
   back to a tab.
+
+## 16. Step 4, first half, built (2026-11-17)
+
+- **Several networks:** a network's tabs stay together, after its own (a new conversation's
+  page goes after its network's last, `TabPage.index`); the status bar and the nick button are
+  the network's in view; Connect and Disconnect act on it.
+- **The tree (I7):** View ▸ Conversations as a tree: a `TreeView` beside the tabs in a splitter,
+  the tabs' row hidden (`Tabs.barVisible`): the networks as roots, their conversations under them
+  (no + boxes), the same unread badges and attention as the tabs (BMDS's tabs.md §2a); a row
+  chosen shows its page, and a page shown selects its row. The choice is kept in `settings.ini`
+  (`[view] tree`), which IRC now writes (`writeSettings()`), with the joins' choice.
+- **Notifications:** a mention or private message not in view (or the window not focused) shows
+  a `Notification` ("alice in #bmds", the text, an Open button), one a conversation (a newer one
+  replaces it); Open shows the conversation and brings the window up (restored if minimized).
+- **The tray:** a `TrayIcon` (communications): a click shows the window, its menu Show IRC and
+  Quit; `emblem-important` and a count in its tooltip while mentions or private messages wait.
+- **The marker:** the first line arriving unread in a conversation puts `ChatView`'s marker under
+  what was read ("new since you looked") before it.
+- **From the Libera.Chat run (§15):** a server's notice is marked `--`, not with its name (a long
+  one widened every line's gutter); a channel without a topic shows no empty bar.
+- **On the board** (two networks on the test server, TLS and plain, nicks `jth` and `jth_b`): the
+  tabs grouped (TestNet, #bmds | PlainNet, #bmds, #quiet); alice's mention of `jth_b` in PlainNet's
+  #bmds notified, the tray marked; Open showed that conversation, the marker above the first
+  unread line; the tree: both networks, the current row selected, an alert's red, a badge's count;
+  the tree kept across a restart. Fixed there: a stale copy of the tab's badge code kept the
+  tree's badge from being set; a channel's member list squeezed to a sliver beside the tree
+  (the splitter keeps it 140 pixels now: `minSecond`). 205 KB of code.
+
+## 17. Step 4, second half, built (2026-11-17)
+
+- **Networks... (I3, I6):** a dialog over the window: the networks listed (a splitter: the names
+  readable), the chosen one's fields in a form (name, server, port, TLS, nick, other nicks, user and
+  real names, the login as a list, account, password masked, certificate and key, more roots, the
+  trusted certificate's fingerprint, channels, connecting at the start); Add, Remove, Save, Cancel.
+  Save checks the names (each, and each its own), takes networks out (disconnected, their tabs
+  closed, the tree made again), gives the others their new settings (the session's from its next
+  connection: `Session::setConfig()`), makes the new ones, writes `networks.ini`
+  (`writeNetworks()`: the first file's comment, then each network; read back the same, tested)
+  and connects what is complete and set to connect at the start. A first start (no network with
+  a nick) opens it by itself, Libera.Chat and OFTC listed "(needs a nick)".
+- **`networks.ini` keeps every network**, a network without a host or nick too (not complete:
+  `isComplete()`, said, not connected), so the dialog edits them all.
+- **Found on the board: the settings lost their config.** `Network` moved its settings' session
+  config into the `Session`, which left the settings' empty: the dialog saved networks without
+  nicks, and `isComplete()` refused every network read from the file. The session now gets a
+  copy.
+- **Register this nick... (§7a):** password (twice, masked), email; `NickServ REGISTER`; the
+  answers read (`Format::registration()`: Atheme's "is now registered", OFTC's "registered.",
+  "VERIFY REGISTER" for a mailed code, the refusals); registered, the network's login becomes
+  SASL with that account and password, saved and used from the next connection; a code typed and
+  Verify sends `VERIFY REGISTER nick code`. The test server gained REGISTER and VERIFY
+  (`--verify-code`).
+- **Passwords a service repeats are hidden:** Atheme answers REGISTER "... with the password
+  hunter22." (Libera's too): the network's password and one being registered are `Buffers`'
+  `secrets`, replaced by `****` in a service's or the server's text (in the view and the log).
+- **A certificate trusted by its fingerprint (I5):** a TLS check refused (the issuer not among the
+  roots, another name) makes a second connection only to read the certificate
+  (`Connection::Trust::Probe`: the check off), then asks: subject, issuer, SHA-256, "Trust this
+  certificate for TestNet?". Yes keeps `fingerprint = SHA256:...` in `networks.ini`; connections
+  are then `Pinned` (the roots' check off, the fingerprint compared after the handshake: a
+  different certificate refused, not asked about again). No leaves it disconnected.
+- **On the board** (the test server, its CA not given): a first start opened Networks...; a network
+  added in it (name, server, nick typed) saved and connected; the check refused, the certificate
+  read, the question asked (its fingerprint the server's, checked on the PC with openssl); Yes:
+  pinned, connected, registered. Register this nick: REGISTER, NickServ's answer, the login kept
+  (`login = sasl`, account, password, in networks.ini), the code verified; the server's KILL:
+  reconnected, logged in by SASL with the new account. A second registration: the password
+  NickServ repeated shown and logged as `****`. Fixed there too: a `Label` is one line (the
+  intro in two), the buttons at the right, the second "Registered" after Verify not repeated.
+  Then (the user's): the dialogs' buttons touched their frame. A window's column is flush with
+  its frame by default (for bars at the edges), so the dialogs set
+  `margin` 8 and `spacing` 4, as the gallery's dialog does. A gap under each form was the
+  toolkit's: fixed in BMDS (its gui.md §4u: a form in a column is sized at the column's width).

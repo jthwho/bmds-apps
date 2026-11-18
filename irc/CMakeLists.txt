@@ -11,7 +11,7 @@ target_include_directories(irc_core PUBLIC core)
 target_link_libraries(irc_core PUBLIC bmds_headers)
 target_compile_options(irc_core PRIVATE -Os -Wall -Wextra -Werror)
 
-bmds_add_program(irc SOURCES bmds/main.cpp bmds/app.cpp bmds/connection.cpp bmds/logs.cpp)
+bmds_add_program(irc SOURCES bmds/main.cpp bmds/app.cpp bmds/dialogs.cpp bmds/connection.cpp bmds/logs.cpp)
 target_include_directories(irc PRIVATE bmds)
 target_link_libraries(irc PRIVATE irc_core)
 target_compile_options(irc PRIVATE -Os -Wall -Wextra -Werror)

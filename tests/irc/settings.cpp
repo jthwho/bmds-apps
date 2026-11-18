@@ -120,20 +120,70 @@ TEST_CASE("networks.ini: mistakes told by line; a network without a host or nick
         CHECK(has("networks.ini:13: C: no host"));
         CHECK(has("networks.ini:15: D: the login needs a password"));
         CHECK(has("networks.ini:19: E: sasl-external needs cert and key (the client certificate)"));
-        REQUIRE(nets.size() == 3); // A, D and E: kept, as they can try
+        REQUIRE(nets.size() == 5); // every one kept, to be filled in
         CHECK(nets[0].name == Text("A"));
         CHECK(nets[0].port == 6697); // the bad one ignored
+        CHECK(nets[0].isComplete());
+        CHECK_FALSE(nets[1].isComplete()); // B: no nick
+        CHECK_FALSE(nets[2].isComplete()); // C: no host
+        CHECK(nets[3].isComplete());       // D: complete, though its login can't work
 }
 
 TEST_CASE("networks.ini: the first one written has Libera.Chat and OFTC, waiting for a nick") {
         irc::Vector<irc::NetworkSettings> nets;
         irc::Vector<irc::String>          problems;
         REQUIRE(irc::readNetworks(irc::FirstNetworks, nets, problems) == Error::Ok);
-        CHECK(nets.size() == 0);
+        REQUIRE(nets.size() == 2);
+        CHECK(nets[0].name == Text("Libera.Chat"));
+        CHECK(nets[1].host == Text("irc.oftc.net"));
+        CHECK_FALSE(nets[0].isComplete());
         const std::vector<std::string> p = strings(problems);
         REQUIRE(p.size() == 2);
         CHECK(p[0].find("OFTC: no nick") != std::string::npos);
         CHECK(p[1].find("Libera.Chat: no nick") != std::string::npos);
+}
+
+TEST_CASE("networks.ini: written and read back the same; copied") {
+        const char                       *ini = "[Libera.Chat]\n"
+                                                "host = irc.libera.chat\nport = 6697\ntls = yes\nnick = jth\naltnicks = jth_, jth2\n"
+                                                "user = u\nrealname = Jason H\nlogin = sasl\naccount = jthacct\npassword = p a s s\n"
+                                                "channels = #bmds, #c key\nautoconnect = no\n"
+                                                "[Test]\nhost = 1.2.3.4\nport = 7000\ntls = no\nnick = t\nlogin = sasl-external\n"
+                                                "cert = me.pem\nkey = me.key\nca = ca.pem\nfingerprint = SHA256:abcd\n";
+        irc::Vector<irc::NetworkSettings> nets, back;
+        irc::Vector<irc::String>          problems;
+        REQUIRE(irc::readNetworks(ini, nets, problems) == Error::Ok);
+        irc::String text;
+        REQUIRE(irc::writeNetworks(nets, text) == Error::Ok);
+        CHECK(test::str(text).rfind("# IRC's networks", 0) == 0); // the comment kept
+        REQUIRE(irc::readNetworks(text, back, problems) == Error::Ok);
+        CHECK(strings(problems).empty());
+        REQUIRE(back.size() == 2);
+        for (size_t i = 0; i < 2; ++i) {
+                const irc::NetworkSettings &a = nets[i], &b = back[i];
+                CHECK(a.name == b.name.view());
+                CHECK(a.host == b.host.view());
+                CHECK(a.port == b.port);
+                CHECK(a.tls == b.tls);
+                CHECK(a.autoconnect == b.autoconnect);
+                CHECK(a.session.nick == b.session.nick.view());
+                CHECK(strings(a.session.altNicks) == strings(b.session.altNicks));
+                CHECK(a.session.user == b.session.user.view());
+                CHECK(a.session.realName == b.session.realName.view());
+                CHECK(a.session.login == b.session.login);
+                CHECK(a.session.account == b.session.account.view());
+                CHECK(a.session.password == b.session.password.view());
+                CHECK(strings(a.session.autojoin) == strings(b.session.autojoin));
+                CHECK(a.cert == b.cert.view());
+                CHECK(a.key == b.key.view());
+                CHECK(a.ca == b.ca.view());
+                CHECK(a.fingerprint == b.fingerprint.view());
+        }
+        irc::NetworkSettings copy;
+        REQUIRE(irc::copySettings(nets[1], copy) == Error::Ok);
+        CHECK(copy.fingerprint == Text("SHA256:abcd"));
+        CHECK(copy.session.login == Login::SaslExternal);
+        CHECK(copy.port == 7000);
 }
 
 TEST_CASE("settings.ini: joins, highlights, logs; mistakes told") {
@@ -155,9 +205,24 @@ TEST_CASE("settings.ini: joins, highlights, logs; mistakes told") {
         CHECK(s.logFolder == Text("/sd0/p0/irclogs"));
         CHECK(strings(problems) == std::vector<std::string>{"settings.ini:9: not a setting: view/font"});
 
+        // Written and read back: the same.
+        s.tree = true;
+        irc::String text;
+        REQUIRE(irc::writeSettings(s, text) == Error::Ok);
+        irc::AppSettings         back;
+        irc::Vector<irc::String> none;
+        REQUIRE(irc::readSettings(text, back, none) == Error::Ok);
+        CHECK(none.size() == 0);
+        CHECK_FALSE(back.showJoins);
+        CHECK(back.tree);
+        CHECK(strings(back.highlights) == std::vector<std::string>{"bmds", "esp32", "p4"});
+        CHECK_FALSE(back.logs);
+        CHECK(back.logFolder == Text("/sd0/p0/irclogs"));
+
         irc::AppSettings empty;
         REQUIRE(irc::readSettings("", empty, problems) == Error::Ok);
         CHECK(empty.showJoins);
+        CHECK_FALSE(empty.tree);
         CHECK(empty.logs);
         CHECK(empty.logFolder == Text("logs"));
 }

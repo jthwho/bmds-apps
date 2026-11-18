@@ -85,6 +85,21 @@ TEST_CASE("Format: local times, nick colours, a password to NickServ hidden") {
         CHECK(hidden("alice", "IDENTIFY secret") == "(as it is)");
 }
 
+TEST_CASE("Format::registration: NickServ's answers to REGISTER and VERIFY") {
+        using R = irc::Format::Registration;
+        using irc::Format::registration;
+        CHECK(registration("jth is now registered to jth@example.com, with the password secret.") == R::Registered);
+        CHECK(registration("Nickname jth registered.") == R::Registered);
+        CHECK(registration("jth has now been verified.") == R::Registered);
+        CHECK(registration("An email containing nickname activation instructions has been sent to jth@example.com. "
+                           "If you do not receive it, /msg NickServ VERIFY REGISTER jth <code>") == R::Verify);
+        CHECK(registration("\x02jth\x02 is already registered.") == R::Refused);
+        CHECK(registration("Invalid email address.") == R::Refused);
+        CHECK(registration("You must have been using this nick for at least 30 seconds to register.") == R::Refused);
+        CHECK(registration("You are now identified for jth.") == R::None);
+        CHECK(registration("") == R::None);
+}
+
 TEST_CASE("Buffers: a channel's messages, its view's and log's lines, counts and attention") {
         World w;
         w.s.say(":jth!u@h JOIN #bmds");
@@ -223,6 +238,11 @@ TEST_CASE("Buffers: joins shown or not, parts and kicks, the topic, server lines
 
         w.s.say(":srv 332 jth #bmds :BMDS on the P4");
         CHECK(w.s.takeLines()[0].view == "10:41 --\x0f\tTopic: BMDS on the P4");
+        // The server's notice: "--", not its name (which would widen every line's gutter).
+        w.s.say(":tungsten.libera.chat NOTICE jth :*** Checking Ident");
+        lines = w.s.takeLines();
+        CHECK(lines[0].buffer == w.buffers.network().id);
+        CHECK(lines[0].view == "10:41 --\x0f\t*** Checking Ident");
         w.s.say(":srv 372 jth :- the message of the day");
         lines = w.s.takeLines();
         CHECK(lines[0].buffer == w.buffers.network().id);
@@ -235,6 +255,20 @@ TEST_CASE("Buffers: joins shown or not, parts and kicks, the topic, server lines
         REQUIRE(lines.size() == 1);
         CHECK(lines[0].view.find("secret") == std::string::npos);
         CHECK(lines[0].log == "10:41:00 <jth> IDENTIFY jth ****");
+
+        // A service repeating a password it was given: hidden too (Atheme's REGISTER answer).
+        irc::String secret;
+        (void)secret.assign("hunter22");
+        (void)w.buffers.settings().secrets.append(std::move(secret));
+        w.s.say(":NickServ!N@services. NOTICE jth :\x02jth\x02 is now registered to \x02"
+                "a@b.c\x02, with the password "
+                "\x02hunter22\x02.");
+        lines = w.s.takeLines();
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].view.find("hunter22") == std::string::npos);
+        CHECK(lines[0].log == "10:41:00 -NickServ- jth is now registered to a@b.c, with the password ****.");
+        w.s.say(":alice!a@h PRIVMSG #bmds :hunter22 is my word"); // a person's: as they said it
+        CHECK(w.s.takeLines()[0].log.find("hunter22") != std::string::npos);
 
         // Kicked: the channel's buffer stays, not joined.
         w.s.say(":carol!c@h KICK #bmds jth :out");

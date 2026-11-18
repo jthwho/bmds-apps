@@ -198,16 +198,45 @@ namespace irc {
                                                  mapping);
                                 }
                                 if (b == nullptr) return Error::NoMem;
-                                // A password typed to NickServ, hidden in the view and the log.
-                                String     hidden;
-                                const Text body = self && Format::hideSecret(e.target, e.text, hidden) ? hidden.view()
-                                                                                                       : e.text.view();
+                                // A password typed to NickServ, or repeated by a service, hidden in the view and
+                                // the log.
+                                String hidden;
+                                Text   body = self && Format::hideSecret(e.target, e.text, hidden) ? hidden.view()
+                                                                                                   : e.text.view();
+                                String repeated;
+                                if (service && !_settings.secrets.isEmpty()) {
+                                        (void)repeated.assign(body);
+                                        for (const String &secret : _settings.secrets) {
+                                                if (secret.size() < 4) continue; // too short to look for
+                                                String     out;
+                                                const Text t = repeated;
+                                                size_t     at = 0;
+                                                for (size_t i = 0; i + secret.size() <= t.size();) {
+                                                        if (t.mid(i, secret.size()) == secret.view()) {
+                                                                (void)out.append(t.mid(at, i - at));
+                                                                (void)out.append("****");
+                                                                i += secret.size();
+                                                                at = i;
+                                                        } else {
+                                                                ++i;
+                                                        }
+                                                }
+                                                (void)out.append(t.mid(at));
+                                                repeated = std::move(out);
+                                        }
+                                        body = repeated;
+                                }
                                 // A service's or the server's text naming us ("identified for jth") isn't a mention.
                                 const bool mention = !self && !service && mentioned(body, s);
                                 // Private (a chat's, or a person's notice to us) or a mention: an alert.
                                 const bool personal = !service && (query || e.target.isEmpty());
                                 level = self ? 1 : (mention || personal) ? 2 : 1;
-                                if (e.kind == Kind::Notice) {
+                                if (e.kind == Kind::Notice && (e.flags & Event::Server) != 0) {
+                                        // The server's: "--", not its name (a long one widens the gutter
+                                        // every line lines up at: ChatView's widest).
+                                        (void)marker.assign("--");
+                                        (void)text.assign(body);
+                                } else if (e.kind == Kind::Notice) {
                                         (void)marker.append('-');
                                         (void)marker.append(e.nick.isEmpty() ? Text("server") : e.nick.view());
                                         (void)marker.append('-');

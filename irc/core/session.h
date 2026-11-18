@@ -136,6 +136,9 @@ namespace irc {
 
                         const Config &config() const { return _config; }
 
+                        /** @brief Takes new settings: the nick, login, channels... from the next connection on. */
+                        void setConfig(Config &&config) { _config = std::move(config); }
+
                         /** @brief A connection is up: registration starts. */
                         void connected(const Now &now);
 
