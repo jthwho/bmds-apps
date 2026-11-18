@@ -82,7 +82,9 @@ namespace irc {
                 // all from the same BMDS release (devplan/irc.md §2).
                 const bool tls = bmds_sys_has(BMDS_SYS_TLS_CTL) != 0;
                 const bool gui = hasEntry(_gui, "ChatView", nullptr) && hasEntry(_gui, "TabPage", "closable") &&
-                                 hasEntry(_gui, "LineEdit", "keys");
+                                 hasEntry(_gui, "LineEdit", "keys") && hasEntry(_gui, "ItemView", "menuRequested") &&
+                                 hasEntry(_gui, "ChatView", "find") && hasEntry(_gui, "LineEdit", "pasteLines") &&
+                                 hasEntry(_gui, "Label", "clicked");
                 if (tls && gui) return true;
                 const uint32_t box = bmds_message_box_new(_gui, 0);
                 bmds_message_box_set_kind(_gui, box, "error");
@@ -151,6 +153,17 @@ namespace irc {
                 struct tm    local;
                 if (localtime_r(&t, &local) != nullptr) _utcOffset = int32_t(local.tm_gmtoff / 60);
                 for (uint32_t n = 0; n < _networks.size(); ++n) updateSecrets(n);
+                // The people ignored (§7f): one list, each network's session looking at it.
+                String masks;
+                for (const String &m : _settings.ignores) {
+                        if (!masks.isEmpty()) (void)masks.append(", ");
+                        (void)masks.append(m);
+                }
+                (void)_ignores.read(masks);
+                for (uint32_t n = 0; n < _networks.size(); ++n) {
+                        applyBehaviour(*_networks[n]);
+                        watchAll(n);
+                }
                 for (Network *n : _networks) {
                         Buffers::Settings &b = n->buffers.settings();
                         b.showJoins = _settings.showJoins;
@@ -189,12 +202,24 @@ namespace irc {
                 _disconnectItem = item(network, "&Disconnect", nullptr);
                 _networksItem = item(network, "&Networks...", nullptr);
                 _registerItem = item(network, "&Register this nick...", nullptr);
+                _notifyItem = item(network, "Notify &list...", nullptr);
+                bmds_menu_add_separator(g, network);
                 _quitItem = item(network, "&Quit", "Ctrl+Q");
                 const uint32_t channel = bmds_menu_new(g, bar);
                 bmds_menu_set_title(g, channel, "&Channel");
                 _joinItem = item(channel, "&Join...", "Ctrl+J");
+                _listItem = item(channel, "&List channels...", "Ctrl+L");
+                _centralItem = item(channel, "Channel C&entral...", nullptr);
                 _partItem = item(channel, "&Part", nullptr);
                 _closeItem = item(channel, "&Close", "Ctrl+W");
+                bmds_menu_add_separator(g, channel);
+                _rejoinItem = item(channel, "&Rejoin when kicked", nullptr);
+                bmds_menu_item_set_checked(g, _rejoinItem, _settings.rejoin);
+                _inviteItem = item(channel, "Join when &invited", nullptr);
+                bmds_menu_item_set_checked(g, _inviteItem, _settings.joinInvited);
+                const uint32_t editMenu = bmds_menu_new(g, bar);
+                bmds_menu_set_title(g, editMenu, "&Edit");
+                _findItem = item(editMenu, "&Find...", "Ctrl+F");
                 const uint32_t view = bmds_menu_new(g, bar);
                 bmds_menu_set_title(g, view, "&View");
                 _joinsItem = item(view, "&Joins and parts", nullptr);
@@ -212,6 +237,22 @@ namespace irc {
                 _tabs = bmds_tabs_new(g, _split);
                 bmds_widget_set_stretch(g, _tabs, 1);
 
+                // Find (§7j): a bar above the input, hidden until asked for.
+                _findRow = bmds_gui_new(g, "Box", _window);
+                bmds_box_set_direction(g, _findRow, "across");
+                bmds_label_set_text(g, bmds_label_new(g, _findRow), "Find:");
+                _findEdit = bmds_line_edit_new(g, _findRow);
+                bmds_widget_set_stretch(g, _findEdit, 1);
+                const auto barButton = [&](const char *text) {
+                        const uint32_t b = bmds_button_new(g, _findRow);
+                        bmds_button_set_text(g, b, text);
+                        return b;
+                };
+                _findPrev = barButton("&Previous");
+                _findNext = barButton("&Next");
+                _findClose = barButton("Close");
+                bmds_widget_set_visible(g, _findRow, 0);
+
                 // The input line: the nick (a click: /nick), the line taking Tab, Up and Down.
                 const uint32_t row = bmds_gui_new(g, "Box", _window);
                 bmds_box_set_direction(g, row, "across");
@@ -221,6 +262,7 @@ namespace irc {
                 bmds_widget_set_stretch(g, _entry, 1);
                 static const char *const keys[] = {"Tab", "Up", "Down"};
                 bmds_line_edit_set_keys(g, _entry, keys, 3);
+                bmds_line_edit_set_paste_lines(g, _entry, 1); // many lines asked about first (§7k)
                 const uint32_t edited = bmds_gui_atom(g, BMDS_GUI_LINE_EDIT_EDITED);
                 bmds_gui_listen(g, _entry, &edited, 1, 1);
 
@@ -463,9 +505,11 @@ namespace irc {
                 Event e;
                 bool  any = false;
                 while (net.session.takeEvent(e)) {
-                        Vector<Line> lines;
-                        (void)net.buffers.apply(e, net.session, lines);
-                        show(n, lines, &e);
+                        if (!routeEvent(n, e)) {
+                                Vector<Line> lines;
+                                (void)net.buffers.apply(e, net.session, lines);
+                                show(n, lines, &e);
+                        }
                         react(n, e);
                         any = true;
                 }
@@ -501,6 +545,11 @@ namespace irc {
                         case Event::Kind::Timeout: disconnect(n, "no answer from the server", true); break;
                         case Event::Kind::Notice: registration(n, e); break;
                         case Event::Kind::Lag: updateStatus(); break;
+                        case Event::Kind::Online:
+                        case Event::Kind::Offline:
+                                sawWatched(n, e);
+                                if (e.kind == Event::Kind::Online) notifyOnline(n, e);
+                                break;
                         case Event::Kind::Perform: {
                                 // Perform's lines (devplan/irc.md §7f) in the network's buffer, then the joins.
                                 for (const String &line : net.session.config().perform) {
@@ -534,6 +583,8 @@ namespace irc {
                 p.tab = bmds_tab_page_new(g, _tabs);
                 if (b != nullptr && b->type == Buffer::Type::Channel) {
                         p.topic = bmds_label_new(g, p.tab);
+                        const uint32_t clicked = bmds_gui_atom(g, BMDS_GUI_LABEL_CLICKED);
+                        bmds_gui_listen(g, p.topic, &clicked, 1, 1); // a double click: Channel Central (§7h)
                         const uint32_t split = bmds_splitter_new(g, p.tab);
                         bmds_splitter_set_direction(g, split, "across");
                         bmds_widget_set_stretch(g, split, 1);
@@ -567,7 +618,8 @@ namespace irc {
 
         Page *App::pageOf(uint32_t id) {
                 for (Page &p : _pages)
-                        if (p.tab == id || p.chat == id || p.members == id) return &p;
+                        if (p.tab == id || p.chat == id || p.members == id || (p.topic != 0 && p.topic == id))
+                                return &p;
                 return nullptr;
         }
 
@@ -619,6 +671,7 @@ namespace irc {
                                 bmds_tree_view_set_attention(_gui, _tree, CString(path).c(), b.attention);
                         }
                 }
+                watchAll(n); // a private chat opened: its person watched (§7b)
                 // The tree: the network's row, its conversations under it in the tabs' order.
                 String kids;
                 for (const Page &p : _pages)
@@ -847,6 +900,15 @@ namespace irc {
                 if (p.network != NoNetwork) {
                         Network &net = *_networks[p.network];
                         _logs.close(net.settings.name, p.buffer);
+                        // A private chat closed: its person no longer watched, unless on the notify list.
+                        const Buffer *b = net.buffers.byId(p.buffer);
+                        if (b != nullptr && b->type == Buffer::Type::Query) {
+                                bool listed = false;
+                                for (const String &nick : net.settings.notify)
+                                        listed =
+                                                listed || sameName(nick, b->name, net.session.isupport().caseMapping());
+                                if (!listed) net.session.unwatch(b->name);
+                        }
                         net.buffers.close(p.buffer);
                 }
                 bmds_gui_destroy(_gui, p.tab); // its widgets with it
@@ -894,7 +956,10 @@ namespace irc {
                         }
                 Vector<String>       texts;
                 Vector<const char *> items;
+                p->nicks.clear();
                 for (const Member *m : order) {
+                        String nick;
+                        if (nick.assign(m->nick) == Error::Ok) (void)p->nicks.append(std::move(nick));
                         String s;
                         if (m->prefixes[0] != '\0') (void)s.append(m->prefixes[0]);
                         (void)s.append(m->nick);
@@ -993,34 +1058,7 @@ namespace irc {
                         note("No network to send it to: set one up in networks.ini");
                         return;
                 }
-                Network     &net = *_networks[p.network];
-                Vector<Line> lines;
-                Outcome      outcome;
-                (void)runCommand(text, net.session, net.buffers, p.buffer, now(), lines, outcome);
-                show(p.network, lines);
-                switch (outcome.action) {
-                        case Outcome::Action::None: break;
-                        case Outcome::Action::Show:
-                                syncPages(p.network);
-                                for (size_t i = 0; i < _pages.size(); ++i)
-                                        if (_pages[i].network == p.network && _pages[i].buffer == outcome.buffer)
-                                                setCurrent(i, true);
-                                break;
-                        case Outcome::Action::Clear:
-                                if (Page *pg = page(p.network, outcome.buffer, false); pg != nullptr)
-                                        bmds_chat_view_clear(_gui, pg->chat);
-                                break;
-                        case Outcome::Action::Close:
-                                for (size_t i = 0; i < _pages.size(); ++i)
-                                        if (_pages[i].network == p.network && _pages[i].buffer == outcome.buffer) {
-                                                closePage(i);
-                                                break;
-                                        }
-                                break;
-                        case Outcome::Action::Quit: net.wanted = false; break;
-                        default: break; // the list, Find, ignores, notify, /server: step 5c
-                }
-                pump(p.network);
+                runIn(p.network, p.buffer, text);
                 return;
         }
 
@@ -1083,6 +1121,7 @@ namespace irc {
         }
 
         void App::menu(uint32_t id) {
+                if (memberChosen(id)) return;
                 const Page    *p = _pages.isEmpty() || _current >= _pages.size() ? nullptr : &_pages[_current];
                 const uint32_t n = p != nullptr ? p->network : NoNetwork;
                 if (id == _networksItem) {
@@ -1112,6 +1151,20 @@ namespace irc {
                         typed("/part");
                 } else if (id == _closeItem) {
                         typed("/close");
+                } else if (id == _listItem) {
+                        if (n != NoNetwork) openChannelList(n, Text());
+                } else if (id == _centralItem) {
+                        openCentral();
+                } else if (id == _notifyItem) {
+                        openNotifyList();
+                } else if (id == _findItem) {
+                        openFind(Text());
+                } else if (id == _rejoinItem || id == _inviteItem) {
+                        bool &on = id == _rejoinItem ? _settings.rejoin : _settings.joinInvited;
+                        on = !on;
+                        bmds_menu_item_set_checked(_gui, id, on);
+                        for (Network *net : _networks) applyBehaviour(*net);
+                        saveSettings();
                 } else if (id == _joinsItem) {
                         _settings.showJoins = !_settings.showJoins;
                         bmds_menu_item_set_checked(_gui, _joinsItem, _settings.showJoins);
@@ -1164,7 +1217,20 @@ namespace irc {
                                 if (key != nullptr && strcmp(key, "Down") == 0) history(1);
                         } else if (bmds_gui_event_is(g, &e, BMDS_GUI_LINE_EDIT_EDITED)) {
                                 _completer.reset();
+                        } else if (bmds_gui_event_is(g, &e, BMDS_GUI_LINE_EDIT_PASTE_REQUESTED) && e.count == 1) {
+                                pasted(Text(e.values[0].text, e.values[0].length));
                         }
+                        return;
+                }
+                if (e.source == _findEdit || e.source == _findPrev || e.source == _findNext) {
+                        // Enter and Previous: back to older lines; Next: on to newer.
+                        if (e.source != _findEdit || bmds_gui_event_is(g, &e, BMDS_GUI_LINE_EDIT_ACCEPTED))
+                                find(e.source != _findNext);
+                        return;
+                }
+                if (e.source == _findClose) {
+                        bmds_widget_set_visible(g, _findRow, 0);
+                        bmds_widget_set_focus(g, _entry);
                         return;
                 }
                 if (e.source == _nick) {
@@ -1176,7 +1242,7 @@ namespace irc {
                         setCurrent(size_t(e.values[0].number), false);
                         return;
                 }
-                if (dialogEvent(e)) return;
+                if (dialogEvent(e) || peopleEvent(e) || channelsEvent(e) || actionsEvent(e)) return;
                 if (e.source == _trustBox && _trustBox != 0) {
                         const uint32_t n = _trustNetwork;
                         const char    *answer =
@@ -1218,8 +1284,15 @@ namespace irc {
                 for (size_t i = 0; i < _notes.size(); ++i) {
                         if (_notes[i].id != e.source) continue;
                         if (bmds_gui_event_is(g, &e, BMDS_GUI_NOTIFICATION_ACTIVATED)) {
-                                // Open: its conversation shown.
-                                for (size_t k = 0; k < _pages.size(); ++k)
+                                // Open: its conversation shown (someone watched: a private chat with them).
+                                if (!_notes[i].nick.isEmpty() && _notes[i].network < _networks.size()) {
+                                        String query;
+                                        (void)query.assign("/query ");
+                                        (void)query.append(_notes[i].nick);
+                                        runIn(_notes[i].network, _networks[_notes[i].network]->buffers.network().id,
+                                              query); // shows the chat
+                                }
+                                for (size_t k = 0; k < _pages.size() && _notes[i].nick.isEmpty(); ++k)
                                         if (_pages[k].network == _notes[i].network &&
                                             _pages[k].buffer == _notes[i].buffer)
                                                 setCurrent(k, true);
@@ -1239,6 +1312,27 @@ namespace irc {
                                         typed("/close");
                                         break;
                                 }
+                        return;
+                }
+                if (e.source == p->topic && bmds_gui_event_is(g, &e, BMDS_GUI_LABEL_CLICKED) && e.count == 1) {
+                        // A double click on the topic: the channel's settings, as mIRC's.
+                        if (e.values[0].number == 2) openCentral();
+                        return;
+                }
+                if (e.source == p->members && bmds_gui_event_is(g, &e, BMDS_GUI_ITEM_VIEW_MENU_REQUESTED) &&
+                    e.count == 3) {
+                        memberMenu(*p, int(e.values[0].number), int(e.values[1].number), int(e.values[2].number));
+                        return;
+                }
+                if (e.source == p->members && bmds_gui_event_is(g, &e, BMDS_GUI_ITEM_VIEW_ACTIVATED) && e.count == 1) {
+                        // A double click: a private chat with them (§7b).
+                        const size_t row = size_t(e.values[0].number);
+                        if (row < p->nicks.size() && p->network != NoNetwork) {
+                                String query;
+                                (void)query.assign("/query ");
+                                (void)query.append(p->nicks[row]);
+                                runIn(p->network, p->buffer, query);
+                        }
                         return;
                 }
                 if (e.source == p->chat && bmds_gui_event_is(g, &e, BMDS_GUI_CHAT_VIEW_LINK_ACTIVATED) &&

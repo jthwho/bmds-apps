@@ -403,6 +403,7 @@ said.
      `MONITOR`, the lists and `INVITE`. **Built** (2026-11-17, §18).
    - **5c, the app:** Add from list..., List channels..., the member menu, Channel Central, the
      notify list, Find, paste protection, the Channel menu's options; tried on the board.
+     **Built** (2026-11-17, §19).
 6. **Release:** after BMDS's next release, the SDK pin raised, `irc` in the repository's
    packages, the README's list; a tag (`vN`) as every release here.
 
@@ -726,3 +727,44 @@ too), inside §8's estimate.
   `ELIST=U`), `MONITOR` (`--no-monitor` for ISON), `ISON`, channel modes and the three lists,
   `333`, `KICK`, `INVITE`, `userhost-in-names`, alice's CTCP answers, and TestServ's `KICKME`,
   `INVITE`, `BOB` (bob quits or comes back) and `LISTWAIT` (the next `LIST` refused).
+
+## 19. Step 5c, the app, built (2026-11-17)
+
+- **Files:** `actions.cpp` (a command run in a given tab, `runIn()`, which `typed()` now uses; what
+  commands leave to the app: `/list /find /ignore /notify /server`; the rejoin and invite options
+  and the ignore list given to each session; watching; Find; the paste dialog; events routed to
+  the dialog open for them), `people.cpp` (the member menu, the kick's reason, the notify list),
+  `channels.cpp` (the channel list, Channel Central), and `dialogs.cpp`'s From list... and Perform.
+- **The member menu** (§7e): a right click on the member list (`ItemView.menuRequested`): Query,
+  Whois (twice: idle time), Copy nick, CTCP ▸ Ping, Version, Time, Control ▸ Op, Deop, Voice,
+  Devoice, Halfop, Dehalfop, Kick, Kick (why)..., Ban, Ban, kick (why)..., Ignore or Unignore, Add
+  to or Remove from the notify list. Each item runs the command as typed in the channel's tab;
+  Control is enabled for an operator (voice and kick for a half-operator; half-ops only where
+  `PREFIX` has `h`). A double click on a member opens a private chat.
+- **The channel list** (§7d): Channel ▸ List channels... (Ctrl+L, or `/list text`): text, users
+  from (3) to (0: any), Get list (Stop while it comes), Join or a double click; kept as offsets in
+  one text, at most 20,000; a heap sort (no libstdc++ on the board); 2,000 rows at most shown. On
+  the board, 869 of the test server's 2,000 channels came filtered by `ELIST` at the server, "rust"
+  narrowed them to 78 as typed, and a double click joined.
+- **Channel Central** (§7h): asks `MODE #c` and the lists the network has; the topic (who set it
+  and when), six common modes, key and limit, applied as one `MODE` on OK; masks added or removed
+  at once. Shown, not changed, for anyone not an operator (the topic under `+t` too). Tried: `+i`,
+  a key, a limit and a ban, each echoed by the server.
+- **The notify list** (§7g): Network ▸ Notify list... (each network's `notify`, now, since when),
+  Add on the network in view, Remove, a double click a private chat; someone on it coming online:
+  a notification whose Open starts a private chat (a first try showed the chat, then the
+  network's tab over it: a nick's note no longer shows its own buffer after).
+- **Find** (Edit ▸ Find..., Ctrl+F, `/find`): a bar above the input; Enter and Previous go back,
+  Next on, the status bar says found or not. **Paste** (§7k): a paste of many lines opens "Send N
+  lines to #c?" with the lines in an editor; each line said (a `/` line as text), paced.
+- **Perform** in Networks... is a button opening an editor of its own, as mIRC's: a `TextEdit` in
+  the form took the whole page (its preferred height, nothing to cap it). Networks...' list is
+  wider for its three buttons (Add, From list..., Remove); From list... reads `servers.ini` from
+  the app's folder, filters as typed, and adds a network (or picks it) with its nick to fill in.
+- **The Channel menu's** Rejoin when kicked and Join when invited, kept in `settings.ini`; an
+  invitation from someone ignored isn't one (tried). `/server -m host port` added a network
+  connected with this one's nick; `/server` alone moves this network to another server (saved).
+- **Checks at the start:** `ItemView.menuRequested`, `ChatView.find` and `LineEdit.pasteLines`
+  too (BMDS's gui.md §4v). The program: 286 KB of code (226 KB before step 5).
+- **The topic's double click** opens Channel Central (BMDS's `Label.clicked`, gui.md §4w, added
+  for it, the user's go-ahead); a single click does nothing. Checked at the start too.

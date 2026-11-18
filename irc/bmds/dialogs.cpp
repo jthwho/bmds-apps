@@ -15,6 +15,8 @@
 #include "format.h"
 #include "util.h"
 
+#include <bmds/app.h>
+
 #include <stdio.h>
 #include <string.h>
 
@@ -124,6 +126,7 @@ namespace irc {
                 const uint32_t listButtons = bmds_gui_new(g, "Box", left);
                 bmds_box_set_direction(g, listButtons, "across");
                 f.add = button(g, listButtons, "&Add");
+                f.fromList = button(g, listButtons, "From &list...");
                 f.remove = button(g, listButtons, "&Remove");
 
                 // The chosen one's fields.
@@ -156,6 +159,11 @@ namespace irc {
                 f.fingerprint =
                         field(g, form, "Trusted certificate:", "Its SHA256: kept when you trust one; empty: none");
                 f.channels = field(g, form, "Channels:", "Joined once connected: #a, #b key");
+                // Perform in a window of its own, as mIRC's (a text editor here would take the page).
+                row = bmds_form_row_new(g, form);
+                bmds_form_row_set_label(g, row, "Perform:");
+                bmds_form_row_set_help(g, row, "Commands run once connected, before the joins");
+                f.perform = button(g, row, "&Edit...");
                 f.autoconnect = bmds_check_box_new(g, form);
                 bmds_check_box_set_text(g, f.autoconnect, "Connect when IRC &starts");
 
@@ -168,7 +176,7 @@ namespace irc {
                 const uint32_t closeRequested = bmds_gui_atom(g, "closeRequested");
                 bmds_gui_listen(g, f.window, &closeRequested, 1, 1);
 
-                bmds_splitter_set_position(g, body, 180);
+                bmds_splitter_set_position(g, body, 250); // the list's three buttons in a row
                 listNetworks();
                 if (!_edit.isEmpty()) loadNetwork(0);
                 bmds_window_show(g, f.window);
@@ -221,6 +229,7 @@ namespace irc {
                 bmds_line_edit_set_text(g, f.fingerprint, CString(n.fingerprint).c());
                 joinList(n.session.autojoin, list);
                 bmds_line_edit_set_text(g, f.channels, CString(list).c());
+                performLabel();
                 bmds_check_box_set_checked(g, f.autoconnect, n.autoconnect);
                 return;
         }
@@ -257,8 +266,86 @@ namespace irc {
                 return;
         }
 
+        void App::performLabel() {
+                if (_editAt >= _edit.size()) return;
+                const size_t count = _edit[_editAt].session.perform.size();
+                char         text[48];
+                if (count == 0)
+                        snprintf(text, sizeof(text), "&Edit... (none)");
+                else
+                        snprintf(text, sizeof(text), "&Edit... (%u command%s)", unsigned(count), count == 1 ? "" : "s");
+                bmds_button_set_text(_gui, _nf.perform, text);
+                return;
+        }
+
+        void App::openPerform() {
+                bmds_gui_t    *g = _gui;
+                NetworkFields &f = _nf;
+                if (f.performWindow != 0 || _editAt >= _edit.size()) return;
+                f.performWindow = bmds_window_new(g, 0);
+                char title[96];
+                snprintf(title, sizeof(title), "Perform on %.*s", int(_edit[_editAt].name.size()),
+                         _edit[_editAt].name.data());
+                bmds_window_set_title(g, f.performWindow, title);
+                bmds_window_set_owner(g, f.performWindow, f.window);
+                bmds_window_set_modal(g, f.performWindow, 1);
+                bmds_window_set_width(g, f.performWindow, 480);
+                bmds_window_set_height(g, f.performWindow, 300);
+                bmds_window_set_margin(g, f.performWindow, 8);
+                bmds_window_set_spacing(g, f.performWindow, 4);
+                bmds_label_set_text(g, bmds_label_new(g, f.performWindow),
+                                    "Commands run once connected, before the channels are joined:");
+                bmds_label_set_text(g, bmds_label_new(g, f.performWindow), "a line each, in order; $me is your nick.");
+                f.performText = bmds_text_edit_new(g, f.performWindow);
+                bmds_widget_set_stretch(g, f.performText, 1);
+                String text;
+                for (const String &line : _edit[_editAt].session.perform) {
+                        (void)text.append(line);
+                        (void)text.append('\n');
+                }
+                bmds_text_edit_set_text(g, f.performText, CString(text).c());
+                const uint32_t row = bmds_gui_new(g, "Box", f.performWindow);
+                bmds_box_set_direction(g, row, "across");
+                bmds_widget_set_stretch(g, row, 0);
+                bmds_widget_set_stretch(g, bmds_gui_new(g, "Spacer", row), 1);
+                f.performOk = button(g, row, "OK");
+                f.performCancel = button(g, row, "Cancel");
+                bmds_window_show(g, f.performWindow);
+                bmds_widget_set_focus(g, f.performText);
+                return;
+        }
+
+        void App::storePerform() {
+                // A command a line, the empty ones and the ends' spaces left out.
+                NetworkFields &f = _nf;
+                if (f.performWindow == 0 || _editAt >= _edit.size()) return;
+                bmds_gui_value_t v;
+                NetworkSettings &n = _edit[_editAt];
+                n.session.perform.clear();
+                if (bmds_text_edit_get_text(_gui, f.performText, &v) == 0) {
+                        const Text all(v.text, v.length);
+                        size_t     at = 0;
+                        while (at < all.size()) {
+                                size_t end = all.find('\n', at);
+                                if (end == Text::NoPos) end = all.size();
+                                Text line = all.mid(at, end - at);
+                                at = end + 1;
+                                while (!line.isEmpty() && (line[0] == ' ' || line[0] == '\t')) line = line.mid(1);
+                                while (!line.isEmpty() &&
+                                       (line[line.size() - 1] == ' ' || line[line.size() - 1] == '\r'))
+                                        line = line.left(line.size() - 1);
+                                String s;
+                                if (!line.isEmpty() && s.assign(line) == Error::Ok)
+                                        (void)n.session.perform.append(std::move(s));
+                        }
+                }
+                return;
+        }
+
         void App::closeNetworks() {
                 if (_nf.window == 0) return;
+                closeServerList();
+                if (_nf.performWindow != 0) bmds_gui_destroy(_gui, _nf.performWindow);
                 bmds_gui_destroy(_gui, _nf.window); // its widgets with it
                 _nf = NetworkFields();
                 _edit.clear();
@@ -328,6 +415,8 @@ namespace irc {
                                 net.session.setConfig(std::move(forSession.session));
                                 net.settings = std::move(copy);
                                 updateSecrets(uint32_t(_editOrigin[i]));
+                                applyBehaviour(net);
+                                watchAll(uint32_t(_editOrigin[i]));
                         } else {
                                 auto *net = new (std::nothrow) Network(std::move(copy));
                                 if (net == nullptr) continue;
@@ -340,6 +429,8 @@ namespace irc {
                                 }
                                 (void)_networks.append(std::move(net));
                                 updateSecrets(uint32_t(_networks.size() - 1));
+                                applyBehaviour(*_networks[_networks.size() - 1]);
+                                watchAll(uint32_t(_networks.size() - 1));
                                 syncPages(uint32_t(_networks.size() - 1));
                         }
                 }
@@ -362,6 +453,109 @@ namespace irc {
                                 break;
                         }
                 updateStatus();
+                return;
+        }
+
+        // ---- Add from the list (servers.ini, §7c)
+
+        void App::openServerList() {
+                bmds_gui_t *g = _gui;
+                if (_sf.window != 0) {
+                        bmds_window_raise(g, _sf.window);
+                        return;
+                }
+                // Read now, kept only while the dialog is open.
+                _servers.clear();
+                Vector<String> problems;
+                String         text;
+                const char    *dir = bmds_app_dir();
+                bool           found = false;
+                if (dir != nullptr) {
+                        String path;
+                        (void)path.assign(dir);
+                        (void)path.append("/servers.ini");
+                        found = readFile(CString(path).c(), text);
+                        if (found) (void)readServers(text, _servers, problems);
+                }
+                ServerListFields &f = _sf;
+                f.window = bmds_window_new(g, 0);
+                bmds_window_set_title(g, f.window, "Add a network from the list");
+                bmds_window_set_owner(g, f.window, _nf.window);
+                bmds_window_set_modal(g, f.window, 1);
+                bmds_window_set_width(g, f.window, 600);
+                bmds_window_set_height(g, f.window, 420);
+                bmds_window_set_margin(g, f.window, 8);
+                bmds_window_set_spacing(g, f.window, 4);
+                const uint32_t top = bmds_gui_new(g, "Box", f.window);
+                bmds_box_set_direction(g, top, "across");
+                bmds_widget_set_stretch(g, top, 0);
+                bmds_label_set_text(g, bmds_label_new(g, top), "Find:");
+                f.filter = bmds_line_edit_new(g, top);
+                bmds_widget_set_stretch(g, f.filter, 1);
+                const uint32_t edited = bmds_gui_atom(g, BMDS_GUI_LINE_EDIT_EDITED);
+                bmds_gui_listen(g, f.filter, &edited, 1, 1);
+                f.view = bmds_details_view_new(g, f.window);
+                bmds_widget_set_stretch(g, f.view, 1);
+                static const char *const columns[] = {"Network", "For", "Connection"};
+                bmds_details_view_set_columns(g, f.view, columns, 3);
+                bmds_details_view_set_column_width(g, f.view, 0, 120);
+                bmds_details_view_set_column_width(g, f.view, 1, 320);
+                bmds_details_view_set_column_width(g, f.view, 2, 120);
+                const uint32_t row = bmds_gui_new(g, "Box", f.window);
+                bmds_box_set_direction(g, row, "across");
+                bmds_widget_set_stretch(g, row, 0);
+                f.status = bmds_label_new(g, row);
+                bmds_widget_set_stretch(g, f.status, 1);
+                f.add = button(g, row, "&Add");
+                f.close = button(g, row, "Close");
+                showServers();
+                if (!found)
+                        bmds_label_set_text(g, f.status,
+                                            "The list isn't installed (IRC isn't running from its app folder).");
+                else if (!problems.isEmpty())
+                        bmds_label_set_text(g, f.status, CString(problems[0]).c());
+                bmds_window_show(g, f.window);
+                bmds_widget_set_focus(g, f.filter);
+                return;
+        }
+
+        void App::showServers() {
+                bmds_gui_t      *g = _gui;
+                bmds_gui_value_t v;
+                String           want;
+                if (bmds_line_edit_get_text(g, _sf.filter, &v) == 0) (void)want.assign(Text(v.text, v.length));
+                const auto has = [&](Text hay) {
+                        const Text n = want;
+                        if (n.isEmpty()) return true;
+                        for (size_t i = 0; i + n.size() <= hay.size(); ++i) {
+                                size_t k = 0;
+                                while (k < n.size() && Text::lower(hay[i + k]) == Text::lower(n[k])) ++k;
+                                if (k == n.size()) return true;
+                        }
+                        return false;
+                };
+                bmds_item_view_clear(g, _sf.view);
+                _serverRows.clear();
+                for (uint32_t i = 0; i < _servers.size(); ++i) {
+                        const ServerEntry &s = _servers[i];
+                        if (!has(s.name) && !has(s.about) && !has(s.host)) continue;
+                        char how[48];
+                        snprintf(how, sizeof(how), s.tls ? "TLS, %u" : "%u, no TLS", unsigned(s.port));
+                        const CString     name(s.name), about(s.about);
+                        const char *const cells[] = {name.c(), about.c(), how};
+                        bmds_details_view_add_row(g, _sf.view, cells, 3);
+                        (void)_serverRows.append(std::move(i));
+                }
+                bmds_widget_set_enabled(g, _sf.add, !_serverRows.isEmpty());
+                return;
+        }
+
+        void App::closeServerList() {
+                if (_sf.window == 0) return;
+                bmds_gui_destroy(_gui, _sf.window);
+                _sf = ServerListFields();
+                _servers.clear();
+                _serverRows.clear();
                 return;
         }
 
@@ -476,8 +670,66 @@ namespace irc {
 
         bool App::dialogEvent(const bmds_gui_event_t &e) {
                 bmds_gui_t    *g = _gui;
+                ServerListFields &sf = _sf;
+                if (sf.window != 0) {
+                        if (e.source == sf.close ||
+                            (e.source == sf.window && bmds_gui_event_is(g, &e, BMDS_GUI_WINDOW_CLOSED))) {
+                                closeServerList();
+                                return true;
+                        }
+                        if (e.source == sf.filter) {
+                                showServers();
+                                return true;
+                        }
+                        if (e.source == sf.add ||
+                            (e.source == sf.view && bmds_gui_event_is(g, &e, BMDS_GUI_ITEM_VIEW_ACTIVATED))) {
+                                bmds_gui_value_t v;
+                                const int32_t    row = e.source == sf.view && e.count == 1 ? int32_t(e.values[0].number)
+                                                       : bmds_item_view_get_current(g, sf.view, &v) == 0
+                                                               ? int32_t(v.number)
+                                                               : -1;
+                                if (row < 0 || size_t(row) >= _serverRows.size()) return true;
+                                const ServerEntry &s = _servers[_serverRows[size_t(row)]];
+                                storeNetwork(_editAt);
+                                // There already: chosen; else added, its nick to fill in.
+                                size_t at = _edit.size();
+                                for (size_t i = 0; i < _edit.size(); ++i)
+                                        if (_edit[i].name.view().equalsIgnoringCase(s.name)) at = i;
+                                if (at == _edit.size()) {
+                                        NetworkSettings n;
+                                        if (networkFrom(s, n) != Error::Ok || _edit.append(std::move(n)) != Error::Ok)
+                                                return true;
+                                        (void)_editOrigin.append(-1);
+                                }
+                                closeServerList();
+                                _editAt = at;
+                                listNetworks();
+                                loadNetwork(_editAt);
+                                bmds_widget_set_focus(g, _nf.nick);
+                                return true;
+                        }
+                }
                 NetworkFields &f = _nf;
+                if (f.performWindow != 0) {
+                        const bool ok = e.source == f.performOk;
+                        if (ok || e.source == f.performCancel ||
+                            (e.source == f.performWindow && bmds_gui_event_is(g, &e, BMDS_GUI_WINDOW_CLOSED))) {
+                                if (ok) storePerform();
+                                bmds_gui_destroy(g, f.performWindow);
+                                f.performWindow = f.performText = f.performOk = f.performCancel = 0;
+                                performLabel();
+                                return true;
+                        }
+                }
                 if (f.window != 0) {
+                        if (e.source == f.perform) {
+                                openPerform();
+                                return true;
+                        }
+                        if (e.source == f.fromList) {
+                                openServerList();
+                                return true;
+                        }
                         if (e.source == f.window || e.source == f.cancel) {
                                 if (e.source == f.cancel || bmds_gui_event_is(g, &e, "closeRequested") ||
                                     bmds_gui_event_is(g, &e, BMDS_GUI_WINDOW_CLOSED))
