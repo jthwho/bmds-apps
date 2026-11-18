@@ -1,7 +1,6 @@
 # IRC (devplan/irc.md): the core (portable C++, tested on the PC: tests/irc) and the program, its
-# app and its package. It needs BMDS's next release (TLS sockets, ChatView, the tabs' marks, the
-# input line's keys): until then it stays out of the repository's package list, and checks for them
-# when it starts.
+# app and its package. It needs a BMDS after 0.3.1 (TLS sockets, ChatView, the tabs' marks, the
+# input line's keys): packages can't require a firmware version, so it checks for them when it starts.
 
 set(IRC_VERSION 0.1.0)
 

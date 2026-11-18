@@ -2,7 +2,7 @@
 Type=Application
 Name=VNC Server
 Comment=Share the desktop with VNC viewers
-Exec=vncserver
+Exec=vncserver --desktop
 Icon=preferences-system-network
 Categories=Network;RemoteAccess;
 X-BMDS-Id=vncserver

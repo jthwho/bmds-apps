@@ -9,6 +9,8 @@
  * listens (from autoexec.sh, or over SSH: the login can end), or stops it, or says how it is.
  *
  *     vncserver            start, in the background
+ *     vncserver --desktop  the same, from the launcher (app.desktop): what isn't a start (running
+ *                          already, or why it can't) told in a notification, as there is no terminal
  *     vncserver -f         start, in the foreground (what the background one runs)
  *     vncserver stop       stop the running one
  *     vncserver status     say whether one runs, and where it listens
@@ -19,6 +21,7 @@
 #include "des.h"
 #include "server.h"
 
+#include <bmds/guiclasses.h>
 #include <bmds/sys.h>
 
 #include <errno.h>
@@ -184,30 +187,55 @@ namespace {
                 return 0;
         }
 
+        // Where the running one really listens into @p where: what it wrote at its start (the
+        // settings may have changed since).
+        void runningAddress(char *where, size_t size) {
+                snprintf(where, size, "an address it didn't say");
+                FILE *f = fopen(PidFile, "r");
+                if (f == nullptr) return;
+                char line[80];
+                if (fgets(line, sizeof(line), f) != nullptr && fgets(line, sizeof(line), f) != nullptr) {
+                        line[strcspn(line, "\r\n")] = '\0';
+                        snprintf(where, size, "%s", line);
+                }
+                fclose(f);
+                return;
+        }
+
         int status() {
                 const pid_t pid = runningPid();
                 if (pid < 0) {
                         printf("vncserver: not running\n");
                         return 1;
                 }
-                // Where it really listens: what it wrote at its start (the settings may have changed since).
-                char  where[80] = "an address it didn't say";
-                FILE *f = fopen(PidFile, "r");
-                if (f != nullptr) {
-                        char line[80];
-                        if (fgets(line, sizeof(line), f) != nullptr && fgets(line, sizeof(line), f) != nullptr) {
-                                line[strcspn(line, "\r\n")] = '\0';
-                                snprintf(where, sizeof(where), "%s", line);
-                        }
-                        fclose(f);
-                }
+                char where[80];
+                runningAddress(where, sizeof(where));
                 printf("vncserver: running (pid %ld), listening on %s\n", long(pid), where);
                 return 0;
         }
 
+        // Started from the launcher (--desktop): @p body in a notification, the terminal's message
+        // there. Nothing if there's no desktop to show it.
+        void tellDesktop(const char *title, const char *body, const char *urgency) {
+                bmds_gui_t *gui = bmds_gui_connect(nullptr);
+                if (gui == nullptr) return;
+                const uint32_t n = bmds_notification_new(gui, 0);
+                bmds_notification_set_app(gui, n, "VNC Server");
+                bmds_notification_set_icon(gui, n, "preferences-system-network");
+                bmds_notification_set_title(gui, n, title);
+                bmds_notification_set_body(gui, n, body);
+                bmds_notification_set_urgency(gui, n, urgency);
+                bmds_notification_show(gui, n);
+                (void)bmds_gui_flush(gui);
+                bmds_gui_close(gui);
+                return;
+        }
+
         // Started from a terminal: the server again, in a session of its own (a login ending doesn't
         // hang it up), told to say on a pipe when it listens; this one prints that and returns.
-        int startInBackground(const char *self) {
+        // @p desktop: from the launcher, a failure told in a notification too (the server's own
+        // "VNC server started" tells a start).
+        int startInBackground(const char *self, bool desktop) {
                 int pipeFds[2];
                 if (pipe(pipeFds) != 0) {
                         perror("vncserver");
@@ -237,22 +265,31 @@ namespace {
                 close(pipeFds[0]);
                 if (got < 2) {
                         fprintf(stderr, "vncserver: it ended before it was listening\n");
+                        if (desktop)
+                                tellDesktop("VNC server didn't start", "It ended before it was listening", "normal");
                         return 1;
                 }
                 fprintf(line[0] == '0' ? stdout : stderr, "vncserver: %s", line + 2);
-                return line[0] == '0' ? 0 : 1;
+                if (line[0] == '0') return 0;
+                if (desktop) {
+                        line[strcspn(line, "\r\n")] = '\0';
+                        tellDesktop("VNC server didn't start", line + 2, "normal");
+                }
+                return 1;
         }
 
 } // namespace
 
 int main(int argc, char **argv) {
-        bool foreground = false, verbose = false;
+        bool foreground = false, verbose = false, desktop = false;
         int  ready = -1;
         for (int i = 1; i < argc; ++i) {
                 if (strcmp(argv[i], "-f") == 0) {
                         foreground = true;
                 } else if (strcmp(argv[i], "-v") == 0) {
                         verbose = true;
+                } else if (strcmp(argv[i], "--desktop") == 0) {
+                        desktop = true;
                 } else if (strcmp(argv[i], "--ready") == 0 && i + 1 < argc) {
                         ready = atoi(argv[++i]);
                 } else if (strcmp(argv[i], "stop") == 0) {
@@ -262,15 +299,21 @@ int main(int argc, char **argv) {
                 } else if (strcmp(argv[i], "passwd") == 0) {
                         return setPassword();
                 } else {
-                        fprintf(stderr, "usage: vncserver [-f [-v]] | stop | status | passwd\n");
+                        fprintf(stderr, "usage: vncserver [--desktop | -f [-v]] | stop | status | passwd\n");
                         return 2;
                 }
         }
         if (runningPid() >= 0) {
                 fprintf(stderr, "vncserver: running already ('vncserver status')\n");
+                if (desktop) {
+                        char where[80], body[160];
+                        runningAddress(where, sizeof(where));
+                        snprintf(body, sizeof(body), "Listening on %s; Stop Server is in its tray icon's menu", where);
+                        tellDesktop("VNC server is running already", body, "low");
+                }
                 return 1;
         }
-        if (!foreground) return startInBackground(argv[0]);
+        if (!foreground) return startInBackground(argv[0], desktop);
 
         vnc::Settings s;
         char          value[32];

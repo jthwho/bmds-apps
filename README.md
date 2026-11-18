@@ -1,8 +1,8 @@
 # bmds-apps
 
 Applications for [BMDS](https://github.com/jthwho/bmds), each a package that `pkg` installs,
-and the repository that serves them. For now there is one, **Minesweeper**; more of BMDS's
-non-core applications will move here.
+and the repository that serves them: **Minesweeper**, **IRC** and the **VNC Server**; more of
+BMDS's non-core applications will move here. IRC and the VNC server need a BMDS newer than 0.3.1.
 
 It is also the worked example of publishing packages for BMDS. Everything below applies to a
 repository of your own: fork this one and follow [Your own repository](#your-own-repository).
@@ -12,7 +12,7 @@ repository of your own: fork this one and follow [Your own repository](#your-own
 Add this repository once, in a terminal:
 
     pkg source add https://github.com/jthwho/bmds-apps/releases/latest/download
-    pkg install minesweeper
+    pkg install minesweeper irc vncserver
 
 or in **Settings ▸ Software ▸ Add Source...** with the same address, then `pkg install`.
 
@@ -37,10 +37,10 @@ and an index signed by any other key is refused.
     minesweeper/            the game: field.c (rules), draw.c (pictures), main.c (the window),
                             app.desktop, icons/, DESCRIPTION, and its CMakeLists.txt
     irc/                    IRC (devplan/irc.md): core/ its portable C++ core, bmds/ the program;
-                            app.desktop, DESCRIPTION (not in the package list until BMDS's next
-                            release, which it needs)
-    vnc/                    the VNC server, being built (devplan/vnc.md): core/ is its protocol and
-                            encodings in portable C++; it needs a BMDS with screen capture
+                            app.desktop, DESCRIPTION, servers.ini
+    vnc/                    the VNC server (devplan/vnc.md): core/ is its protocol and encodings in
+                            portable C++, main.cpp and server.cpp the program; app.desktop,
+                            DESCRIPTION
     tests/                  the rules' tests, on the PC: Minesweeper's, IRC's and VNC's cores, the fuzzers
     thirdparty/doctest/     the C++ tests' framework (MIT)
     thirdparty/zlib/        zlib 1.3.1's deflate, for the VNC server (the zlib licence; VENDORED.md)
@@ -63,8 +63,9 @@ hash. To build against a BMDS checkout instead (a newer SDK, or BMDS's own devel
     cmake -S . -B build -G Ninja -DBMDS_KEY=$HOME/.config/bmds/bmds-apps.key
     cmake --build build
 
-`build/repository/` is then a complete repository: `index.bmpi`, `minesweeper_1.0.0.bmpk`,
-`key.pub`. Without `-DBMDS_KEY`, the dev key signs (the build warns): fine for trying on your own
+`build/repository/` is then a complete repository: `index.bmpi`, the packages
+(`minesweeper_1.0.0.bmpk`, `irc_0.1.0.bmpk`, `vncserver_0.1.0.bmpk`), `key.pub`. Without
+`-DBMDS_KEY`, the dev key signs (the build warns): fine for trying on your own
 board, but a source pinned to the bmds-apps key won't take it.
 
 The rules' tests run on the PC, with the PC's compiler (C and C++, under the sanitizers):

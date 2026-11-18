@@ -13,6 +13,6 @@ then point a viewer at localhost:5900. Set a password with 'vncserver passwd'. W
 vnc/listen at lan (and a password) it listens on the network too, with TLS (VeNCrypt) and the
 board's own certificate: 'tls cert' shows the fingerprint a viewer asks you to accept. Viewers
 without VeNCrypt (TightVNC) need vnc/encryption at none: the password alone, readable on the wire.
-Start it with 'vncserver' (from autoexec.sh, or over SSH); 'vncserver stop' ends it. While it runs
-it has an icon in the tray (a red dot on it while a viewer is in), and a viewer coming or going
-shows a notification.
+Start it from the launcher (VNC Server), or with 'vncserver' (from autoexec.sh, or over SSH);
+Stop Server in its tray icon's menu or 'vncserver stop' ends it. While it runs it has an icon in
+the tray (a red dot on it while a viewer is in), and a viewer coming or going shows a notification.

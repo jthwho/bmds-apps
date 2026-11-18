@@ -1,7 +1,7 @@
 # The VNC server (devplan/vnc.md): the core (portable C++, tested on the PC: tests/vnc), zlib
 # (thirdparty/zlib: deflate, and inflate for the Extended Clipboard), and the program, its app and
-# its package. It needs a BMDS with screen capture (gui_screen_capture, slot 136): until that
-# release it stays out of the repository's package list.
+# its package. It needs a BMDS with screen capture (gui_screen_capture, slot 136): it checks at
+# its start and says so.
 
 set(VNCSERVER_VERSION 0.1.0)
 
