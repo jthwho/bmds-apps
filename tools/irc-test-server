@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+# @file      irc-test-server
+# @copyright Jason Howard. All rights reserved.
+#
+# SPDX-License-Identifier: MIT
+# See LICENSE file in the project root folder for license information.
+#
+# A small IRC server to try the IRC client against (devplan/irc.md §3a, §9), on the PC:
+#
+#   tools/irc-test-server --out DIR [--name HOST] [--account NAME:PASSWORD]... [--chatter SECONDS]
+#
+# DIR gets ca.pem, the CA its certificate is signed by: give it to the client (networks.ini's
+# ca = ...). HOST is the name or address the client connects to (the certificate's). The keys
+# live in a temporary folder under ~/.cache, removed when this ends.
+#
+#   6697  TLS        6667  plain TCP
+#
+# What it speaks: CAP LS 302 / REQ / END (sasl=PLAIN, server-time, message-tags, echo-message,
+# multi-prefix, away-notify, extended-join, account-notify, cap-notify, chghost), SASL PLAIN
+# against the --account list, NICK (433 when taken), USER, PING/PONG, JOIN, PART, PRIVMSG,
+# NOTICE, TOPIC, NAMES, MODE (+o +v), AWAY, WHOIS, QUIT; 001-005, the MOTD.
+# NickServ: IDENTIFY [account] password (900 and a notice), GHOST nick password.
+# A bot, alice, in #bmds: a line every --chatter seconds, some of them mentioning whoever is
+# there; bob joins and parts now and then.
+# TestServ, for the board's tests: "KILL" closes your connection, "SILENT n" stops answering
+# your PINGs for n seconds, "FLOOD n" sends you n lines in #bmds at once, "QUERY" has alice send you
+# a private message.
+#
+# Python's standard library and the openssl command only.
+
+import argparse
+import asyncio
+import base64
+import os
+import random
+import shutil
+import signal
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+
+CAPS = ["sasl=PLAIN", "server-time", "message-tags", "echo-message", "multi-prefix", "away-notify",
+        "extended-join", "account-notify", "cap-notify", "chghost"]
+SERVER = "irc.test"
+
+
+def openssl(*args, cwd):
+        subprocess.run(["openssl", *args], cwd=cwd, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+
+
+def make_certificates(work, name):
+        """A CA, and a server certificate for NAME (CN and subjectAltName), EC P-256."""
+        openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", "ca.key", cwd=work)
+        openssl("req", "-x509", "-new", "-key", "ca.key", "-days", "30", "-subj", "/CN=IRC test CA",
+                "-out", "ca.pem", cwd=work)
+        san = "DNS:%s" % name
+        if all(part.isdigit() for part in name.split(".")) and name.count(".") == 3:
+                san += ",IP:%s" % name
+        with open(os.path.join(work, "server.ext"), "w") as f:
+                f.write("subjectAltName=%s\n" % san)
+        openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", "server.ec", cwd=work)
+        openssl("pkcs8", "-topk8", "-nocrypt", "-in", "server.ec", "-out", "server.key", cwd=work)
+        openssl("req", "-new", "-key", "server.key", "-subj", "/CN=" + name, "-out", "server.csr", cwd=work)
+        openssl("x509", "-req", "-in", "server.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
+                "-days", "30", "-extfile", "server.ext", "-out", "server.pem", cwd=work)
+
+
+def now_tag():
+        t = time.time()
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % int((t % 1) * 1000)
+
+
+def fold(name):
+        return name.lower().replace("[", "{").replace("]", "}").replace("\\", "|").replace("~", "^")
+
+
+class Client:
+        def __init__(self, server, reader, writer, secure):
+                self.server, self.reader, self.writer, self.secure = server, reader, writer, secure
+                self.nick, self.user, self.real = None, None, None
+                self.caps, self.capping, self.registered = set(), False, False
+                self.account, self.away, self.host = None, None, "user/test"
+                self.silent_until = 0
+                self.sasl = False
+
+        def source(self):
+                return "%s!%s@%s" % (self.nick, self.user or "u", self.host)
+
+        def send(self, line, tags=None):
+                if "message-tags" in self.caps or "server-time" in self.caps:
+                        tag = "time=" + now_tag()
+                        if tags:
+                                tag += ";" + tags
+                        line = "@" + tag + " " + line
+                try:
+                        self.writer.write((line + "\r\n").encode("utf-8", "replace"))
+                except Exception:
+                        pass
+
+        def reply(self, numeric, *params):
+                parts = [":%s" % SERVER, numeric, self.nick or "*"] + list(params[:-1])
+                self.send(" ".join(parts) + " :" + params[-1] if params else " ".join(parts))
+
+        async def run(self):
+                try:
+                        while True:
+                                raw = await self.reader.readline()
+                                if not raw:
+                                        break
+                                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                                if line:
+                                        self.server.log("<- %s %s" % (self.nick or "?", line))
+                                        self.handle(line)
+                                await self.writer.drain()
+                except (ConnectionError, ssl.SSLError, asyncio.IncompleteReadError):
+                        pass
+                self.server.gone(self, "Connection closed")
+                try:
+                        self.writer.close()
+                except Exception:
+                        pass
+
+        def handle(self, line):
+                if line.startswith("@"):
+                        line = line.split(" ", 1)[1] if " " in line else ""
+                if " :" in line:
+                        head, last = line.split(" :", 1)
+                        params = head.split() + [last]
+                else:
+                        params = line.split()
+                if not params:
+                        return
+                cmd, args = params[0].upper(), params[1:]
+                fn = getattr(self, "on_" + cmd.lower(), None)
+                if fn is None:
+                        if self.registered:
+                                self.reply("421", cmd, "Unknown command")
+                        return
+                if not self.registered and cmd not in ("CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PING", "QUIT"):
+                        self.reply("451", "You have not registered")
+                        return
+                fn(args)
+
+        # Registration
+        def on_cap(self, args):
+                sub = args[0].upper() if args else ""
+                if sub == "LS":
+                        self.capping = True
+                        self.send(":%s CAP %s LS :%s" % (SERVER, self.nick or "*", " ".join(CAPS)))
+                elif sub == "REQ":
+                        want = args[-1].split()
+                        names = [c.split("=")[0] for c in CAPS]
+                        if all(w.lstrip("-") in names for w in want):
+                                for w in want:
+                                        if w.startswith("-"):
+                                                self.caps.discard(w[1:])
+                                        else:
+                                                self.caps.add(w)
+                                self.send(":%s CAP %s ACK :%s" % (SERVER, self.nick or "*", " ".join(want)))
+                        else:
+                                self.send(":%s CAP %s NAK :%s" % (SERVER, self.nick or "*", " ".join(want)))
+                elif sub == "END":
+                        self.capping = False
+                        self.try_register()
+
+        def on_authenticate(self, args):
+                if not args:
+                        return
+                if args[0].upper() == "PLAIN":
+                        self.sasl = True
+                        self.send("AUTHENTICATE +")
+                        return
+                if not self.sasl:
+                        self.reply("904", "SASL authentication failed")
+                        return
+                self.sasl = False
+                try:
+                        _, account, password = base64.b64decode(args[0]).decode().split("\0")
+                except Exception:
+                        self.reply("904", "SASL authentication failed")
+                        return
+                if self.server.accounts.get(account) == password:
+                        self.account = account
+                        self.reply("900", self.source(), account, "You are now logged in as %s" % account)
+                        self.reply("903", "SASL authentication successful")
+                else:
+                        self.reply("904", "SASL authentication failed")
+
+        def on_nick(self, args):
+                if not args:
+                        self.reply("431", "No nickname given")
+                        return
+                nick = args[0]
+                other = self.server.users.get(fold(nick))
+                if other is not None and other is not self:
+                        self.reply("433", nick, "Nickname is already in use")
+                        return
+                if self.registered:
+                        old = self.source()
+                        self.server.rename(self, nick)
+                        for c in self.server.peers(self, include_self=True):
+                                c.send(":%s NICK :%s" % (old, nick))
+                else:
+                        if self.nick:
+                                self.server.users.pop(fold(self.nick), None)
+                        self.nick = nick
+                        self.server.users[fold(nick)] = self
+                        self.try_register()
+
+        def on_user(self, args):
+                if len(args) >= 4:
+                        self.user, self.real = args[0][:10], args[3]
+                        self.try_register()
+
+        def try_register(self):
+                if self.registered or self.capping or not self.nick or not self.user:
+                        return
+                self.registered = True
+                self.reply("001", "Welcome to the IRC test network, %s" % self.nick)
+                self.reply("002", "Your host is %s" % SERVER)
+                self.reply("003", "This server was created for BMDS's tests")
+                self.reply("004", SERVER, "test-1", "i", "bklmnopstv", "This server's modes")
+                self.reply("005", "CASEMAPPING=rfc1459", "CHANTYPES=#", "NETWORK=TestNet", "PREFIX=(ov)@+",
+                           "CHANMODES=b,k,l,imnpst", "are supported by this server")
+                self.reply("375", "- %s Message of the day -" % SERVER)
+                self.reply("372", "- A test server: nothing here is kept.")
+                self.reply("376", "End of /MOTD command.")
+
+        def on_ping(self, args):
+                if time.time() < self.silent_until:
+                        return
+                self.send(":%s PONG %s :%s" % (SERVER, SERVER, args[-1] if args else ""))
+
+        def on_pong(self, args):
+                pass
+
+        def on_quit(self, args):
+                self.server.gone(self, "Quit: " + (args[-1] if args else ""))
+                try:
+                        self.writer.close()
+                except Exception:
+                        pass
+
+        # Channels
+        def on_join(self, args):
+                if not args:
+                        return
+                for name in args[0].split(","):
+                        if not name.startswith("#"):
+                                self.reply("403", name, "No such channel")
+                                continue
+                        self.server.join(self, name)
+
+        def on_part(self, args):
+                if args:
+                        for name in args[0].split(","):
+                                self.server.part(self, name, args[1] if len(args) > 1 else "")
+
+        def on_topic(self, args):
+                ch = self.server.channel(args[0]) if args else None
+                if ch is None:
+                        self.reply("403", args[0] if args else "*", "No such channel")
+                elif len(args) == 1:
+                        self.reply("332", ch["name"], ch["topic"]) if ch["topic"] else self.reply("331", ch["name"], "No topic")
+                else:
+                        ch["topic"] = args[1]
+                        for c in ch["members"]:
+                                c.send(":%s TOPIC %s :%s" % (self.source(), ch["name"], args[1]))
+
+        def on_names(self, args):
+                ch = self.server.channel(args[0]) if args else None
+                if ch is not None:
+                        self.server.names(self, ch)
+
+        def on_mode(self, args):
+                if not args:
+                        return
+                ch = self.server.channel(args[0])
+                if ch is None:
+                        if fold(args[0]) == fold(self.nick or ""):
+                                self.send(":%s MODE %s :%s" % (self.nick, self.nick, args[1] if len(args) > 1 else "+i"))
+                        return
+                if len(args) == 1:
+                        self.reply("324", ch["name"], "+nt", "the modes")
+                        return
+                sign, at, changes = "+", 2, []
+                for m in args[1]:
+                        if m in "+-":
+                                sign = m
+                                continue
+                        if m in "ov" and at < len(args):
+                                target = self.server.users.get(fold(args[at]))
+                                at += 1
+                                if target in ch["members"]:
+                                        prefixes = ch["members"][target]
+                                        p = "@" if m == "o" else "+"
+                                        ch["members"][target] = (prefixes + p if sign == "+" and p not in prefixes
+                                                                 else prefixes.replace(p, "") if sign == "-" else prefixes)
+                                        changes.append((sign + m, target.nick))
+                for change, nick in changes:
+                        for c in ch["members"]:
+                                c.send(":%s MODE %s %s %s" % (self.source(), ch["name"], change, nick))
+
+        def on_away(self, args):
+                self.away = args[-1] if args and args[-1] else None
+                self.reply("306" if self.away else "305", "You have been marked as being away" if self.away
+                           else "You are no longer marked as being away")
+                for c in self.server.peers(self):
+                        if "away-notify" in c.caps:
+                                c.send(":%s AWAY :%s" % (self.source(), self.away) if self.away else ":%s AWAY" % self.source())
+
+        def on_whois(self, args):
+                who = self.server.users.get(fold(args[-1])) if args else None
+                if who is None:
+                        self.reply("401", args[-1] if args else "*", "No such nick")
+                else:
+                        self.reply("311", who.nick, who.user or "u", who.host, "*", who.real or "")
+                        if who.account:
+                                self.reply("330", who.nick, who.account, "is logged in as")
+                self.reply("318", args[-1] if args else "*", "End of /WHOIS list")
+
+        # Messages
+        def on_privmsg(self, args, notice=False):
+                if len(args) < 2:
+                        self.reply("412", "No text to send")
+                        return
+                target, text = args[0], args[1]
+                cmd = "NOTICE" if notice else "PRIVMSG"
+                if fold(target) == "nickserv" and not notice:
+                        self.server.nickserv(self, text)
+                        return
+                if fold(target) == "testserv" and not notice:
+                        self.server.testserv(self, text)
+                        return
+                if target.lstrip("@+").startswith("#"):
+                        ch = self.server.channel(target.lstrip("@+"))
+                        if ch is None or self not in ch["members"]:
+                                self.reply("404", target, "Cannot send to channel")
+                                return
+                        for c in ch["members"]:
+                                if c is not self or "echo-message" in self.caps:
+                                        c.send(":%s %s %s :%s" % (self.source(), cmd, target, text))
+                        return
+                other = self.server.users.get(fold(target))
+                if other is None:
+                        self.reply("401", target, "No such nick")
+                        return
+                other.send(":%s %s %s :%s" % (self.source(), cmd, other.nick, text))
+                if "echo-message" in self.caps:
+                        self.send(":%s %s %s :%s" % (self.source(), cmd, other.nick, text))
+
+        def on_notice(self, args):
+                self.on_privmsg(args, notice=True)
+
+
+class Bot:
+        """A user without a socket: alice in #bmds, bob joining and parting."""
+
+        def __init__(self, server, nick, real):
+                self.server, self.nick, self.real = server, nick, real
+                self.user, self.host, self.caps, self.account, self.away = nick, "bots", set(), nick, None
+                self.registered = True
+
+        def source(self):
+                return "%s!%s@%s" % (self.nick, self.user, self.host)
+
+        def send(self, line, tags=None):
+                pass
+
+
+class Server:
+        def __init__(self, accounts, verbose):
+                self.users, self.channels, self.accounts, self.verbose = {}, {}, accounts, verbose
+                self.alice = Bot(self, "alice", "Alice the bot")
+                self.bob = Bot(self, "bob", "Bob the bot")
+                self.users["alice"] = self.alice
+                self.join(self.alice, "#bmds")
+                self.channel("#bmds")["members"][self.alice] = "@"
+                self.channel("#bmds")["topic"] = "BMDS, an OS for the ESP32-P4 | https://github.com/jthwho/bmds"
+
+        def log(self, text):
+                if self.verbose:
+                        print(text, flush=True)
+
+        def channel(self, name):
+                return self.channels.get(fold(name))
+
+        def peers(self, client, include_self=False):
+                seen = {client} if include_self else set()
+                for ch in self.channels.values():
+                        if client in ch["members"]:
+                                seen.update(ch["members"])
+                if not include_self:
+                        seen.discard(client)
+                return seen
+
+        def rename(self, client, nick):
+                self.users.pop(fold(client.nick), None)
+                client.nick = nick
+                self.users[fold(nick)] = client
+
+        def names(self, client, ch):
+                multi = "multi-prefix" in client.caps
+                items = [(p if multi else p[:1]) + c.nick for c, p in ch["members"].items()]
+                client.reply("353", "=", ch["name"], " ".join(items))
+                client.reply("366", ch["name"], "End of /NAMES list.")
+
+        def join(self, client, name):
+                ch = self.channels.setdefault(fold(name), {"name": name, "topic": "", "members": {}})
+                if client in ch["members"]:
+                        return
+                ch["members"][client] = ""
+                for c in ch["members"]:
+                        if "extended-join" in c.caps:
+                                c.send(":%s JOIN %s %s :%s" % (client.source(), ch["name"], client.account or "*", client.real or ""))
+                        else:
+                                c.send(":%s JOIN %s" % (client.source(), ch["name"]))
+                if isinstance(client, Client):
+                        if ch["topic"]:
+                                client.reply("332", ch["name"], ch["topic"])
+                        self.names(client, ch)
+
+        def part(self, client, name, reason):
+                ch = self.channel(name)
+                if ch is None or client not in ch["members"]:
+                        return
+                for c in ch["members"]:
+                        c.send(":%s PART %s :%s" % (client.source(), ch["name"], reason) if reason
+                               else ":%s PART %s" % (client.source(), ch["name"]))
+                del ch["members"][client]
+
+        def gone(self, client, reason):
+                if self.users.get(fold(client.nick or "")) is not client:
+                        return
+                for c in self.peers(client):
+                        c.send(":%s QUIT :%s" % (client.source(), reason))
+                for ch in self.channels.values():
+                        ch["members"].pop(client, None)
+                self.users.pop(fold(client.nick), None)
+                self.log("-- %s gone: %s" % (client.nick, reason))
+
+        def notice_from(self, who, client, text):
+                client.send(":%s NOTICE %s :%s" % (who, client.nick, text))
+
+        def nickserv(self, client, text):
+                ns = "NickServ!NickServ@services.%s" % SERVER
+                words = text.split()
+                cmd = words[0].upper() if words else ""
+                if cmd == "IDENTIFY" and len(words) >= 2:
+                        account = words[1] if len(words) >= 3 else client.nick
+                        if self.accounts.get(account) == words[-1]:
+                                client.account = account
+                                client.reply("900", client.source(), account, "You are now logged in as %s" % account)
+                                self.notice_from(ns, client, "You are now identified for %s." % account)
+                        else:
+                                self.notice_from(ns, client, "Invalid password for %s." % account)
+                elif cmd == "GHOST" and len(words) >= 3:
+                        other = self.users.get(fold(words[1]))
+                        if other is None or not isinstance(other, Client):
+                                self.notice_from(ns, client, "%s is not online." % words[1])
+                        elif self.accounts.get(words[1]) != words[2]:
+                                self.notice_from(ns, client, "Invalid password for %s." % words[1])
+                        else:
+                                self.gone(other, "Killed (NickServ (GHOST command used by %s))" % client.nick)
+                                try:
+                                        other.writer.close()
+                                except Exception:
+                                        pass
+                                self.notice_from(ns, client, "%s has been ghosted." % words[1])
+                else:
+                        self.notice_from(ns, client, "Commands here: IDENTIFY [account] password, GHOST nick password.")
+
+        def testserv(self, client, text):
+                ts = "TestServ!TestServ@services.%s" % SERVER
+                words = text.split()
+                cmd = words[0].upper() if words else ""
+                if cmd == "KILL":
+                        self.notice_from(ts, client, "Closing your connection.")
+                        client.writer.close()
+                elif cmd == "SILENT" and len(words) >= 2:
+                        client.silent_until = time.time() + int(words[1])
+                        self.notice_from(ts, client, "Not answering your PINGs for %s s." % words[1])
+                elif cmd == "QUERY":
+                        client.send(":%s PRIVMSG %s :psst, %s: a private word" % (self.alice.source(), client.nick, client.nick))
+                elif cmd == "FLOOD" and len(words) >= 2:
+                        for i in range(int(words[1])):
+                                client.send(":%s PRIVMSG #bmds :flood line %d of %s" % (self.alice.source(), i + 1, words[1]))
+                else:
+                        self.notice_from(ts, client, "KILL, SILENT seconds, FLOOD lines, QUERY")
+
+        def say(self, bot, channel, text):
+                ch = self.channel(channel)
+                if ch is None:
+                        return
+                for c in ch["members"]:
+                        c.send(":%s PRIVMSG %s :%s" % (bot.source(), ch["name"], text))
+
+        async def chatter(self, seconds):
+                lines = ["Hello, #bmds!", "Did the TLS land?", "\x02Bold\x02, \x1ditalic\x1d and \x0304red\x03.",
+                         "The docs: https://github.com/jthwho/bmds", "\x01ACTION waves\x01",
+                         "A long line, to see it wrap with a hanging indent under the nick's gutter, which is "
+                         "what a chat view does when the window is narrower than what was said."]
+                n = 0
+                while True:
+                        await asyncio.sleep(seconds)
+                        n += 1
+                        people = [c for c in self.channel("#bmds")["members"] if isinstance(c, Client)]
+                        if not people:
+                                continue
+                        if n % 5 == 0:
+                                if self.bob in self.channel("#bmds")["members"]:
+                                        self.part(self.bob, "#bmds", "later")
+                                else:
+                                        self.users["bob"] = self.bob
+                                        self.join(self.bob, "#bmds")
+                        elif n % 3 == 0:
+                                self.say(self.alice, "#bmds", "%s: what do you think?" % random.choice(people).nick)
+                        else:
+                                self.say(self.alice, "#bmds", lines[n % len(lines)])
+
+
+async def main():
+        parser = argparse.ArgumentParser(description="An IRC server for the IRC client's tests.")
+        parser.add_argument("--out", required=True, help="where ca.pem goes")
+        parser.add_argument("--name", default="irc-test", help="the name or address clients connect to")
+        parser.add_argument("--account", action="append", default=[], help="NAME:PASSWORD (SASL, NickServ)")
+        parser.add_argument("--chatter", type=float, default=8.0, help="seconds between alice's lines (0: none)")
+        parser.add_argument("--verbose", action="store_true", help="print every line received")
+        args = parser.parse_args()
+        accounts = dict(a.split(":", 1) for a in args.account)
+        work = tempfile.mkdtemp(prefix="irc-test-server-", dir=os.path.expanduser("~/.cache"))
+        try:
+                make_certificates(work, args.name)
+                os.makedirs(args.out, exist_ok=True)
+                shutil.copy(os.path.join(work, "ca.pem"), os.path.join(args.out, "ca.pem"))
+                context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                context.load_cert_chain(os.path.join(work, "server.pem"), os.path.join(work, "server.key"))
+                server = Server(accounts, args.verbose)
+
+                def serve(secure):
+                        async def handler(reader, writer):
+                                await Client(server, reader, writer, secure).run()
+                        return handler
+
+                tls = await asyncio.start_server(serve(True), "0.0.0.0", 6697, ssl=context)
+                plain = await asyncio.start_server(serve(False), "0.0.0.0", 6667)
+                print("irc-test-server: TLS on 6697, plain on 6667, as %s; the CA in %s" %
+                      (args.name, os.path.join(args.out, "ca.pem")), flush=True)
+                tasks = [tls.serve_forever(), plain.serve_forever()]
+                if args.chatter > 0:
+                        tasks.append(server.chatter(args.chatter))
+                await asyncio.gather(*tasks)
+        finally:
+                shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+        # SIGTERM as Ctrl+C: main()'s finally removes the keys either way.
+        signal.signal(signal.SIGTERM, lambda signum, frame: (_ for _ in ()).throw(KeyboardInterrupt()))
+        try:
+                asyncio.run(main())
+        except KeyboardInterrupt:
+                sys.exit(0)

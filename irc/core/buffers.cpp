@@ -23,12 +23,11 @@ namespace irc {
                         return;
                 }
 
-                // A nick in its colour (ours in bold), the colour ended after it.
+                // A nick in its colour, the colour ended after it; ours plain (not bold: ChatView starts a
+                // run in another font on a 4-pixel column, which leaves gaps round a short nick).
                 void colouredNick(String &out, Text nick, bool self, CaseMapping mapping) {
                         if (self) {
-                                (void)out.append('\x02');
                                 (void)out.append(nick);
-                                (void)out.append('\x02');
                                 return;
                         }
                         (void)out.append('\x03');
@@ -203,7 +202,8 @@ namespace irc {
                                 String     hidden;
                                 const Text body = self && Format::hideSecret(e.target, e.text, hidden) ? hidden.view()
                                                                                                        : e.text.view();
-                                const bool mention = !self && mentioned(body, s);
+                                // A service's or the server's text naming us ("identified for jth") isn't a mention.
+                                const bool mention = !self && !service && mentioned(body, s);
                                 // Private (a chat's, or a person's notice to us) or a mention: an alert.
                                 const bool personal = !service && (query || e.target.isEmpty());
                                 level = self ? 1 : (mention || personal) ? 2 : 1;

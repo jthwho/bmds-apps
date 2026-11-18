@@ -6,8 +6,8 @@ release, which brings what it needs: TLS sockets (`tls_ctl`, network.md §35) an
 (BMDS's `devplan/chatview.md`). **Approved as proposed** 2026-11-16 (§11).
 
 Status: **step 0 built in BMDS** (`ChatView`: its chatview.md §7-§9; the tabs' additions: its
-tabs.md §7-§9); **steps 1 and 2 built** (§12; §13: containers, ISUPPORT, formatting, the
-session; §14: buffers, commands, completion); step 3, the app, next.
+tabs.md §7-§9; the input line's keys: its chatview.md §10); **steps 1 to 3 built** (§12; §13,
+§14: the core; §15: the app, against `tools/irc-test-server`, then Libera.Chat); step 4 next.
 Paths below are this repository's unless they name BMDS.
 
 ## 1. Goal
@@ -370,7 +370,7 @@ Buffers, commands and Tab completion: the core is whole (60 KB for the board at 
   joined, who spoke last (32, for Tab).
 - **`Buffers`** (one a network): the session's events routed (§7b) and made into `Line`s, each
   with its view's text (`HH:MM marker`, a tab, the text, mIRC's codes kept; nicks in a colour of
-  their own, ours bold, a mention's marker reversed) and its log's (`HH:MM:SS marker text`,
+  their own, ours plain (§15), a mention's marker reversed) and its log's (`HH:MM:SS marker text`,
   plain), in the zone the settings give.
   - A channel's or private chat's messages to it, a private chat opened by a message; a
     service's or the server's notice to the network's buffer, a person's to the buffer in view
@@ -397,3 +397,71 @@ Buffers, commands and Tab completion: the core is whole (60 KB for the board at 
   and its mistakes; Tab's orders and cycling). `irc_session_fuzz` now types commands in its
   buffers, presses Tab and passes every event through the buffers: 3 minutes on three workers,
   about 1.9 million runs each, 1757 edges, nothing found.
+
+## 15. Step 3, the app, built (2026-11-17)
+
+One network's window, over TLS, with the logins, logs and the start's check; tried on the board
+against `tools/irc-test-server`. 199 KB of code (`-Os`; the core 60 KB of it at `-O2`, now `-Os`
+too), inside §8's estimate.
+
+- **In BMDS first: the input line's keys** (its chatview.md §10). Tab moved the focus and a
+  `LineEdit`'s cursor couldn't be read, so Tab completion and the history (§6) had no way in.
+  `LineEdit` gained `cursor` and `keys` (Tab, Up, Down, PageUp, PageDown taken by the program,
+  told as `keyPressed`), in the same release as `ChatView`.
+- **`core/settings`:** `networks.ini` (a section a network: host, port, tls, nick, altnicks, user,
+  realname, login, account, password, cert, key, ca, channels, autoconnect) and `settings.ini`
+  (`[view] joins`, `[highlights] words`, `[logs] enabled, folder`); each mistake told with its
+  file and line in the network's tab; a network without a host or nick left out. A first start
+  writes `networks.ini` with Libera.Chat and OFTC waiting for a nick (I6; the Networks dialog is
+  step 4). `ca` (a PEM file of roots, added to the system's) is new: a network with a CA of its
+  own (the test server's, a private one) without turning the check off (I5).
+- **`bmds/connection`:** the name looked up on a thread of its own (getaddrinfo blocks; the
+  thread owns its pipe's write end, so a connection given up meanwhile costs nothing), each
+  address tried with a non-blocking connect (30 s), then libtls over the socket (the handshake
+  the kernel's, `TLS_WANT_POLLOUT` while it runs); everything waits in the one `poll()` with the
+  GUI's fd. SIGPIPE is ignored.
+- **`bmds/logs`:** `logs/NETWORK/BUFFER/YYYY-MM-DD.log` in the data folder, the folder names lower
+  case and safe for FAT. Found on the board: BMDS's FAT locks an open file, so logs kept open
+  couldn't be read while IRC ran. Lines now wait in memory and are appended (open, write, close)
+  every 5 s and at the end.
+- **`bmds/app`:** the window (§6) without the tree, the tray and notifications (step 4): menus
+  (Network: Connect, Disconnect, Quit; Channel: Join..., Part, Close; View: joins and parts; Help:
+  About), a tab a buffer (a channel's with its topic, and its members in a splitter, by rank then
+  name, the away marked), the tabs' badges (unread) and attention, close buttons (a channel
+  parted first), the nick button, the input line (Enter: `runCommand`; Tab: the completer, with
+  the line's cursor; Up and Down: the last 100 lines), the status bar (the state, TLS's version,
+  the account, the lag; the cipher in the network's tab). A link clicked: an `irc://` one joins
+  its channel, any other is copied (BMDS has no browser yet) and said. A lost connection is
+  said with when it tries again (§7's backoff); a timeout drops it. Closing the window sends
+  `QUIT` and gives it a second to go. The start checks for `tls_ctl`, `ChatView`,
+  `TabPage.closable` and `LineEdit.keys`, and says the firmware needs updating if one is missing.
+  The data folder is `bmds_app_data_dir()`'s, or `$HOME/.local/share/irc` run from a shell.
+- **`tools/irc-test-server`:** Python's standard library and `openssl`; TLS (its own CA, `ca.pem`
+  written for the client) and plain; CAP 302 with §1's caps, SASL PLAIN, NickServ (IDENTIFY,
+  GHOST), channels, NAMES, modes, away, server-time, echo-message; alice chatting in #bmds
+  (styles, a link, a /me, mentions), bob joining and leaving; TestServ (`KILL`, `SILENT n`,
+  `FLOOD n`, `QUERY`). Its keys in a folder under ~/.cache, removed when it ends (SIGTERM too).
+- **On the board** (the PC's server, `ca` and SASL in `networks.ini`, the data folder under a
+  `HOME` of the test's): TLS 1.2 up, logged in by SASL, #bmds joined with its topic and members;
+  alice's styles, colours, link and /me; a mention reversed; a line typed; `al` + Tab gave
+  `alice: `; `/me`; the member list following bob; the server's `KILL`: "connecting again in 2
+  s", connected, logged in and #bmds joined again by itself; alice's private message opened a
+  tab with an alert; `/ns IDENTIFY` answered (the password hidden); `/close` closed the private
+  chat; the channel's close button parted it; closing the window sent `QUIT`; the logs readable
+  while running and after.
+- **Fixed on the board:** our own nick bold left gaps (a run in another font starts on a 4-pixel
+  column): plain now. A service's notice naming us ("identified for jth") counted as a mention:
+  services and the server don't mention. The status bar was too narrow for the cipher suite:
+  the version only there. A dropped connection left the member lists as they were: emptied.
+- **Libera.Chat by hand** (the user's go-ahead; a test nick, `bmdstest974`, no login, only a
+  channel of our own, `#bmds-test`): TLS 1.2 with Libera's certificate checked against the
+  system's roots, registered, the MOTD (its links clickable), user modes, #bmds-test joined
+  (ours: `@`, the server's `+Cnst`), a line sent, the topic set and shown above the view,
+  `/whois` answered in the network's tab ("using a secure connection [TLSv1.2,
+  ECDHE-RSA-CHACHA20-POLY1305]"), `QUIT` on closing. Seen there: the server's notices
+  (`-tungsten.libera.chat-`) make the network tab's gutter as wide as the server's name, as
+  `ChatView` lines gutters up at the widest; a server's notice is better marked `--` (step 4).
+  An empty topic leaves an empty bar above the view.
+- **Not yet:** step 4's Networks dialog, nick registration, several networks shown, the tree
+  view, notifications and the tray, pinning a fingerprint, and the marker ("new since") on going
+  back to a tab.

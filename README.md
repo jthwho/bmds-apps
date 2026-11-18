@@ -36,7 +36,9 @@ and an index signed by any other key is refused.
     keys/bmds-apps.pub      the public half of the signing key (the private half is never here)
     minesweeper/            the game: field.c (rules), draw.c (pictures), main.c (the window),
                             app.desktop, icons/, DESCRIPTION, and its CMakeLists.txt
-    irc/                    IRC, being built (devplan/irc.md): core/ is its portable C++ core
+    irc/                    IRC (devplan/irc.md): core/ its portable C++ core, bmds/ the program;
+                            app.desktop, DESCRIPTION (not in the package list until BMDS's next
+                            release, which it needs)
     vnc/                    the VNC server, being built (devplan/vnc.md): core/ is its protocol and
                             encodings in portable C++; it needs a BMDS with screen capture
     tests/                  the rules' tests, on the PC: Minesweeper's, IRC's and VNC's cores, the fuzzers
@@ -46,6 +48,7 @@ and an index signed by any other key is refused.
     tools/icons.py          draws the game's icons
     tools/vncview.py        a test viewer for the VNC server (Python, Pillow)
     tools/release           builds, signs and (with --publish) releases
+    tools/irc-test-server   a small IRC server (TLS with its own CA) to try IRC against
     .github/workflows/      the release workflow: a tag in, a GitHub release out
 
 ## Building

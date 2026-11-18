@@ -1,0 +1,4 @@
+Chat on IRC networks, over TLS
+An IRC client for BMDS's desktop: a tab for each channel and private chat, several networks,
+TLS by default, SASL and NickServ logins, links, mentions marked, Tab completion, and logs on
+the card. Its networks are in networks.ini in its data folder.

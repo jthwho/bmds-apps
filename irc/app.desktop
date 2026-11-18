@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=IRC
+Comment=Chat on IRC networks
+Exec=irc
+Icon=mail-send
+Categories=Network;Chat;
+X-BMDS-Id=irc

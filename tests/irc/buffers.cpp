@@ -151,7 +151,7 @@ TEST_CASE("Buffers: a channel's messages, its view's and log's lines, counts and
         REQUIRE(w.s.session.privmsg("#bmds", "mine", w.s.now) == Error::Ok);
         w.s.flush();
         lines = w.s.takeLines();
-        CHECK(lines[0].view == "10:41 <\x02jth\x02>\x0f\tmine");
+        CHECK(lines[0].view == "10:41 <jth>\x0f\tmine");
         CHECK(lines[0].log == "10:41:00 <jth> mine");
         CHECK(bmds->unread == 2); // alice's /me counted, ours not
         w.s.say(":alice!a@h NOTICE #bmds :a notice");
@@ -191,10 +191,10 @@ TEST_CASE("Buffers: private chats opened, alerts, renamed with the nick; notices
         CHECK(lines[0].view.find("quit (bye)") != std::string::npos);
 
         // Notices: a service's to the network's buffer, a person's to the one in view.
-        w.s.say(":NickServ!N@services. NOTICE jth :You are now identified");
+        w.s.say(":NickServ!N@services. NOTICE jth :You are now identified for jth.");
         lines = w.s.takeLines();
         CHECK(lines[0].buffer == w.buffers.network().id);
-        CHECK(lines[0].level == 1);
+        CHECK(lines[0].level == 1); // naming us: not a mention, from a service
         w.buffers.setActive(w.find("#bmds")->id, true);
         w.s.say(":bob!b@h NOTICE jth :psst, a notice");
         lines = w.s.takeLines();
@@ -241,7 +241,7 @@ TEST_CASE("Buffers: joins shown or not, parts and kicks, the topic, server lines
         lines = w.s.takeLines();
         REQUIRE(w.find("#bmds") != nullptr);
         CHECK_FALSE(w.find("#bmds")->joined);
-        CHECK(lines[0].view == "10:41 <--\x0f\t\x02jth\x02 was kicked by carol (out)");
+        CHECK(lines[0].view == "10:41 <--\x0f\tjth was kicked by carol (out)");
 
         // The zone the times are shown in; a line of the client's own.
         w.buffers.settings().utcOffsetMinutes = -480;
