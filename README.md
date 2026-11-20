@@ -2,7 +2,7 @@
 
 Applications for [BMDS](https://github.com/jthwho/bmds), each a package that `pkg` installs,
 and the repository that serves them: **Minesweeper**, **IRC** and the **VNC Server**; more of
-BMDS's non-core applications will move here. IRC and the VNC server need a BMDS newer than 0.3.1.
+BMDS's non-core applications will move here. IRC and the VNC server need BMDS 0.4.0 or newer.
 
 It is also the worked example of publishing packages for BMDS. Everything below applies to a
 repository of your own: fork this one and follow [Your own repository](#your-own-repository).

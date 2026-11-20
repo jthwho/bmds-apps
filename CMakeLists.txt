@@ -7,8 +7,8 @@ cmake_minimum_required(VERSION 3.20)
 
 # The SDK: a BMDS release's (pinned here: its bmds-sdk-VERSION.tar.gz and that file's SHA-256 from
 # the release's SHA256SUMS), or a checkout's with -DBMDS_SDK_DIR.
-set(BMDS_SDK_VERSION "0.3.1" CACHE STRING "")
-set(BMDS_SDK_SHA256 "d96cffc9a2972fb14287821a6cd9a73362189753f3067e70fc3fd0a47b5d96c0" CACHE STRING "")
+set(BMDS_SDK_VERSION "0.4.0" CACHE STRING "")
+set(BMDS_SDK_SHA256 "8f5aadbeb398414e87015ee9853c1e1605796a444c5cc2db7de812a181abdb22" CACHE STRING "")
 include(cmake/sdk.cmake)
 
 project(bmds-apps C CXX ASM)
