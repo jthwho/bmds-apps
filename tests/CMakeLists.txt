@@ -54,7 +54,8 @@ target_link_libraries(vnc_test PRIVATE vnc_core)
 add_test(NAME vnc COMMAND vnc_test)
 
 # The I/O Manager's core (devplan/ioman.md), as the board builds it.
-add_executable(ioman_test ioman/main.cpp ioman/pins.cpp ioman/setup.cpp ../ioman/core/pins.cpp ../ioman/core/setup.cpp)
+add_executable(ioman_test ioman/main.cpp ioman/pins.cpp ioman/setup.cpp ioman/ports.cpp ../ioman/core/pins.cpp
+        ../ioman/core/setup.cpp ../ioman/core/ports.cpp)
 target_include_directories(ioman_test PRIVATE ../thirdparty/doctest ../ioman/core)
 target_compile_definitions(ioman_test PRIVATE DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS)
 target_compile_options(ioman_test PRIVATE -fno-exceptions -fno-rtti)

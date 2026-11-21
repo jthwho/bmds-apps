@@ -42,8 +42,9 @@ and an index signed by any other key is refused.
     vnc/                    the VNC server (devplan/vnc.md): core/ is its protocol and encodings in
                             portable C++, main.cpp and server.cpp the program; app.desktop,
                             DESCRIPTION
-    ioman/                  the I/O Manager (devplan/ioman.md): core/ the pin list in portable C++,
-                            main.cpp the program; app.desktop, DESCRIPTION, icons/
+    ioman/                  the I/O Manager (devplan/ioman.md): core/ the pin list, pin setups and
+                            ports' words in portable C++, main.cpp the program and portstab.cpp
+                            its Ports tab; app.desktop, DESCRIPTION, icons/
     tests/                  the rules' tests, on the PC: Minesweeper's, IRC's, VNC's and the I/O
                             Manager's cores, the fuzzers
     thirdparty/doctest/     the C++ tests' framework (MIT)

@@ -7,7 +7,13 @@ Pins lists them all, sortable, by class or by connector; choose one for everythi
 connectors (UEXT, EXT1) as their headers are laid out, each pin coloured by who holds it with
 its level inside, and then every pad of the chip; click one to see it on Pins.
 
-It only reads: nothing is taken or changed. It reads /dev/gpiochip0, the same device Linux's
-GPIO tools use.
+Beside a pin, its setup: input, output or open drain, its level and pulls, its edges watched
+and drawn; a pin a driver holds is asked about before it is taken. Ports lists BMDS's UART and
+SPI ports and the system's I2C buses: a port's pins and settings as fields, started, stopped and
+saved, and a tool for each: a terminal on a UART, a scan and register reads and writes on an
+I2C bus, transfers on an SPI device.
 
-Needs a BMDS newer than 0.4.0 (gpio_ctl).
+It reads /dev/gpiochip0, the same device Linux's GPIO tools use; settings go through sysconf
+(io/gpio, io/uartN, io/spiN), so they last until a restart unless saved.
+
+Needs a BMDS newer than 0.4.0 (gpio_ctl; the Ports tab: io/uartN, i2c_ctl, io/spiN).

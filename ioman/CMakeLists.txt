@@ -7,7 +7,7 @@ set(IOMAN_VERSION 0.1.0)
 
 # The core is built into the program (not a library after libc on the link line, whose calls it
 # makes and the program might not).
-bmds_add_program(ioman SOURCES main.cpp core/pins.cpp core/setup.cpp ICONS icons/16.png icons/32.png)
+bmds_add_program(ioman SOURCES main.cpp portstab.cpp core/pins.cpp core/setup.cpp core/ports.cpp ICONS icons/16.png icons/32.png)
 target_include_directories(ioman PRIVATE core)
 target_compile_options(ioman PRIVATE -Os -Wall -Wextra -Werror)
 

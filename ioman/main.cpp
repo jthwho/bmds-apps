@@ -7,13 +7,15 @@
  *
  * ioman, the I/O Manager (devplan/ioman.md): every pin of the chip, who holds it, what the IO_MUX
  * and the GPIO matrix route through it and its live level (Pins, with the chosen pin's every
- * detail beside the table), and the board's connectors as they are laid out (Board). It reads
- * `/dev/gpiochip0` with `gpio_ctl` (BMDS's slot 139) ten times a second while its window is shown
- * and not minimized, and draws only what changed. One at a time: a second start raises the first.
+ * detail beside the table), the board's connectors as they are laid out (Board), and BMDS's
+ * ports with a tool for each (Ports: portstab.cpp). It reads `/dev/gpiochip0` with `gpio_ctl`
+ * (BMDS's slot 139) ten times a second while Pins or Board is shown and the window isn't
+ * minimized, and draws only what changed. One at a time: a second start raises the first.
  */
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -25,6 +27,7 @@
 #include <bmds/sys.h>
 
 #include "pins.h"
+#include "portstab.h"
 #include "setup.h"
 
 using ioman::Pin;
@@ -107,6 +110,8 @@ namespace {
                         void   ask(const ioman::PinSetup &setup, const char *why);
                         size_t edgesText(char *out, size_t size);
                         void   say(const char *text);
+                        static void sayFor(void *app, const char *text) { static_cast<App *>(app)->say(text); }
+                        void        pollOnce();
                         bool   isMinimized();
 
                         bmds_gui_t *_gui = nullptr;
@@ -158,6 +163,10 @@ namespace {
                         size_t        _edgeCount = 0;
                         uint32_t      _edgeLost = 0;
 
+
+                        // Ports (BMDS's io/uartN, io/spiN, the system's I2C buses).
+                        ioman::PortsTab _ports;
+                        bool            _hasPorts = false;
 
                         // Board.
                         uint32_t _padButton[MaxPins] = {};
@@ -544,6 +553,7 @@ namespace {
                 if (_problem[0] == '\0') {
                         buildPins(_tabs);
                         buildBoard(_tabs);
+                        if (_hasPorts) _ports.build(_gui, _tabs, _window, sayFor, this);
                         char text[128];
                         snprintf(text, sizeof(text), "%.*s on %.*s", int(sizeof(_chip.label)), _chip.label,
                                  int(sizeof(_chip.board)), _chip.board);
@@ -569,7 +579,7 @@ namespace {
         }
 
         void App::refresh() {
-                if (_fd < 0) return;
+                if (_fd < 0 || _tab > 1) return; // Ports keeps itself up to date
                 static bmds_gpio_pin_t raw[MaxPins];
                 bmds_gpio_pins_t       request{};
                 request.size = sizeof(request);
@@ -830,6 +840,7 @@ namespace {
                         bmds_window_raise(gui, _window);
                         return;
                 }
+                if (_hasPorts && _ports.event(e)) return;
                 if (e.source == _ask && _ask != 0 && bmds_gui_event_is(gui, &e, BMDS_GUI_MESSAGE_BOX_ANSWERED) &&
                     e.count == 1) {
                         const bool yes = strcmp(bmds_gui_atom_name(gui, uint32_t(e.values[0].number)), "yes") == 0;
@@ -917,6 +928,27 @@ namespace {
                 return;
         }
 
+        // The GUI's events, and the Ports tab's fds (sysconf's io/ changes, a UART's tty), in one
+        // poll(): nothing is read on a timer that a notification brings.
+        void App::pollOnce() {
+                bmds_gui_event_t e;
+                int              r = 0;
+                while (!_done && (r = bmds_gui_next_event(_gui, &e, 0)) == 1) event(e); // read already
+                if (_done || r < 0 || bmds_gui_flush(_gui) != 0) {
+                        _done = true;
+                        return;
+                }
+                struct pollfd fds[4];
+                fds[0] = pollfd{bmds_gui_fd(_gui), POLLIN, 0};
+                const size_t mine = _hasPorts ? _ports.pollFds(fds + 1, 3) : 0;
+                if (poll(fds, nfds_t(1 + mine), -1) < 0 && errno != EINTR) {
+                        _done = true;
+                        return;
+                }
+                if (mine > 0) _ports.serviceFds(fds + 1, mine);
+                return;
+        }
+
         int App::run() {
                 _gui = bmds_gui_connect(nullptr);
                 if (_gui == nullptr) {
@@ -933,6 +965,7 @@ namespace {
                 }
                 bmds_services_register(_gui, _services, Service);
                 if (!open()) fprintf(stderr, "ioman: %s\n", _problem);
+                _hasPorts = _problem[0] == '\0' && _ports.open(); // a BMDS with ports
                 build();
                 const uint32_t closeRequested = bmds_gui_atom(_gui, BMDS_GUI_WINDOW_CLOSE_REQUESTED);
                 bmds_gui_listen(_gui, _window, &closeRequested, 1, 1);
@@ -943,13 +976,8 @@ namespace {
                         refresh();
                         bmds_timer_start(_gui, _timer);
                 }
-                while (!_done) {
-                        bmds_gui_event_t e;
-                        if (bmds_gui_flush(_gui) != 0) break;
-                        const int r = bmds_gui_next_event(_gui, &e, -1);
-                        if (r < 0) break;
-                        if (r > 0) event(e);
-                }
+                while (!_done) pollOnce();
+                _ports.close();
                 if (_fd >= 0) ::close(_fd);
                 bmds_gui_close(_gui);
                 return 0;
