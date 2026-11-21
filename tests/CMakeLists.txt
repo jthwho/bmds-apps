@@ -1,5 +1,5 @@
 # The apps' rules on the PC, with the PC's own compiler (the apps are built with the SDK's):
-# Minesweeper's (C) and IRC's core (C++, doctest).
+# Minesweeper's (C), and IRC's, the VNC server's and the I/O Manager's cores (C++, doctest).
 #
 #   cmake -S tests -B build-tests && cmake --build build-tests && ctest --test-dir build-tests
 #
@@ -52,6 +52,13 @@ target_include_directories(vnc_test PRIVATE ../thirdparty/doctest)
 target_compile_definitions(vnc_test PRIVATE DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS)
 target_link_libraries(vnc_test PRIVATE vnc_core)
 add_test(NAME vnc COMMAND vnc_test)
+
+# The I/O Manager's core (devplan/ioman.md), as the board builds it.
+add_executable(ioman_test ioman/main.cpp ioman/pins.cpp ioman/setup.cpp ../ioman/core/pins.cpp ../ioman/core/setup.cpp)
+target_include_directories(ioman_test PRIVATE ../thirdparty/doctest ../ioman/core)
+target_compile_definitions(ioman_test PRIVATE DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS)
+target_compile_options(ioman_test PRIVATE -fno-exceptions -fno-rtti)
+add_test(NAME ioman COMMAND ioman_test)
 
 # The fuzzers: every object instrumented, so the core's sources are built into each.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")

@@ -18,8 +18,9 @@ include(${BMDS_SDK_DIR}/cmake/BmdsProgram.cmake)
 add_subdirectory(minesweeper)
 add_subdirectory(irc)
 add_subdirectory(vnc)
+add_subdirectory(ioman)
 
 # The repository: every package, its index and the public key, signed with BMDS_KEY. A GitHub
 # release of these files is the source users add:
 #   pkg source add https://github.com/jthwho/bmds-apps/releases/latest/download
-bmds_add_repository(repository PACKAGES minesweeper irc vncserver LABEL "bmds-apps")
+bmds_add_repository(repository PACKAGES minesweeper irc vncserver ioman LABEL "bmds-apps")

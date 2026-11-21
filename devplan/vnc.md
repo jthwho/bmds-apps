@@ -253,7 +253,7 @@ warnings, and the core's tests pass on the PC under ASan and UBSan.
     encoder's working memory (512 KB), zlib's streams.
 - **Not done yet:** the clipboard both ways (step 5), several viewers, VeNCrypt, CopyRect, the
   pointer's shape; the package isn't in the repository's list until the BMDS release with screen
-  capture.
+  capture. (All since done; `vncserver` 0.1.0 released in bmds-apps v3, 2026-11-19, on BMDS 0.4.0.)
 
 ## 12. On the board (2026-11-16, bmds0)
 

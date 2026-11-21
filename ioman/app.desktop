@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=I/O Manager
+Comment=Every pin of the chip: who holds it, what it is routed to, its level; the board's connectors
+Exec=ioman
+Categories=System;Monitor;
+X-BMDS-Id=ioman

@@ -405,7 +405,8 @@ said.
      notify list, Find, paste protection, the Channel menu's options; tried on the board.
      **Built** (2026-11-17, §19).
 6. **Release:** after BMDS's next release, the SDK pin raised, `irc` in the repository's
-   packages, the README's list; a tag (`vN`) as every release here.
+   packages, the README's list; a tag (`vN`) as every release here. **Released** (2026-11-19):
+   `irc` 0.1.0 in bmds-apps v3, on the BMDS 0.4.0 SDK.
 
 ## 11. Decided
 

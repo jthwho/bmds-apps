@@ -1,8 +1,9 @@
 # bmds-apps
 
 Applications for [BMDS](https://github.com/jthwho/bmds), each a package that `pkg` installs,
-and the repository that serves them: **Minesweeper**, **IRC** and the **VNC Server**; more of
-BMDS's non-core applications will move here. IRC and the VNC server need BMDS 0.4.0 or newer.
+and the repository that serves them: **Minesweeper**, **IRC**, the **VNC Server** and the **I/O
+Manager**; more of BMDS's non-core applications will move here. IRC and the VNC server need
+BMDS 0.4.0 or newer; the I/O Manager a BMDS newer than 0.4.0.
 
 It is also the worked example of publishing packages for BMDS. Everything below applies to a
 repository of your own: fork this one and follow [Your own repository](#your-own-repository).
@@ -12,7 +13,7 @@ repository of your own: fork this one and follow [Your own repository](#your-own
 Add this repository once, in a terminal:
 
     pkg source add https://github.com/jthwho/bmds-apps/releases/latest/download
-    pkg install minesweeper irc vncserver
+    pkg install minesweeper irc vncserver ioman
 
 or in **Settings ▸ Software ▸ Add Source...** with the same address, then `pkg install`.
 
@@ -41,11 +42,14 @@ and an index signed by any other key is refused.
     vnc/                    the VNC server (devplan/vnc.md): core/ is its protocol and encodings in
                             portable C++, main.cpp and server.cpp the program; app.desktop,
                             DESCRIPTION
-    tests/                  the rules' tests, on the PC: Minesweeper's, IRC's and VNC's cores, the fuzzers
+    ioman/                  the I/O Manager (devplan/ioman.md): core/ the pin list in portable C++,
+                            main.cpp the program; app.desktop, DESCRIPTION, icons/
+    tests/                  the rules' tests, on the PC: Minesweeper's, IRC's, VNC's and the I/O
+                            Manager's cores, the fuzzers
     thirdparty/doctest/     the C++ tests' framework (MIT)
     thirdparty/zlib/        zlib 1.3.1's deflate, for the VNC server (the zlib licence; VENDORED.md)
     devplan/                designs, as BMDS keeps them
-    tools/icons.py          draws the game's icons
+    tools/icons.py          draws Minesweeper's and the I/O Manager's icons
     tools/vncview.py        a test viewer for the VNC server (Python, Pillow)
     tools/release           builds, signs and (with --publish) releases
     tools/irc-test-server   a small IRC server (TLS with its own CA) to try IRC against

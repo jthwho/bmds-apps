@@ -1,0 +1,13 @@
+Shows every pin of the board's chip: which driver or program holds it (or that the board wires
+it to something fixed), what the IO_MUX and the GPIO matrix route through it, its direction and
+pulls, and its level, live, ten times a second while the window is shown.
+
+Pins lists them all, sortable, by class or by connector; choose one for everything about it
+(its IO_MUX functions, the matrix signals in and out, drive, strapping). Board draws the board's
+connectors (UEXT, EXT1) as their headers are laid out, each pin coloured by who holds it with
+its level inside, and then every pad of the chip; click one to see it on Pins.
+
+It only reads: nothing is taken or changed. It reads /dev/gpiochip0, the same device Linux's
+GPIO tools use.
+
+Needs a BMDS newer than 0.4.0 (gpio_ctl).
